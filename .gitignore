@@ -1,0 +1,85 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+Makefile
+
+# Compiled object files
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+bin/
+
+# Python bindings
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+dist/
+*.whl
+.Python
+venv/
+ENV/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-*
+.vs/
+
+# Test and coverage files
+*.gcda
+*.gcno
+*.gcov
+coverage/
+*.profdata
+*.profraw
+
+# Documentation builds
+docs/_build/
+docs/html/
+docs/latex/
+
+# Temporary and log files
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+*.patch
+
+# Package managers
+.conan/
+vcpkg_installed/
+
+# Performance and profiling
+perf.data
+perf.data.old
+*.flame
+callgrind.*
+
+# C++ specific
+*.gch
+*.pch
+compile_commands.json
