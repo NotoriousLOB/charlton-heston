@@ -161,6 +161,8 @@ typedef struct {
     double gamma_val, theta_val, nu_val, rho_val;
     double gamma_alpha1, gamma_alpha2;
     double *a_weights;     /* Triangular packed Adams weights */
+    double *t_alpha_cache; /* Precomputed pow(t[n], alpha) for n=0..N */
+    double *k_alpha1_cache;/* Precomputed pow(k, alpha+1) for k=0..N+2 */
     double *dct_evals;     /* Gupta-Joshi DCT eigenvalues (NULL = O(N^2) fallback) */
     double *dct_aux_buf;   /* Scratch buffer for DCT transforms */
     notorious_fft_aux *fft_aux; /* Notorious-FFT aux for DCT-II/III */
@@ -378,20 +380,21 @@ static inline void charlton_pricing_result_init(charlton_pricing_result *r) {
 static inline void charlton__compute_adams_weights(charlton_abm_solver *s) {
     double h_alpha = pow(s->h, s->alpha);
     size_t N = s->N;
+    double ap1 = s->alpha + 1.0;
     for (size_t k = 0; k < N; ++k) {
         size_t base = k * (k + 1) / 2;
-        double kp1 = (double)(k + 1);
         s->a_weights[base + k] = h_alpha * s->gamma_alpha2;
         if (k == 0) continue;
         double k0 = (double)k;
+        double kp1_ap1 = s->k_alpha1_cache[k + 1];
         s->a_weights[base] = h_alpha * s->gamma_alpha2 *
-            (pow(kp1, s->alpha + 1.0) - (k0 - s->alpha) * pow(kp1, s->alpha));
+            (kp1_ap1 - (k0 - s->alpha) * pow((double)(k + 1), s->alpha));
         for (size_t j = 1; j < k; ++j) {
-            double kj = (double)(k - j);
+            size_t m = k - j;
             s->a_weights[base + j] = h_alpha * s->gamma_alpha2 *
-                (pow(kj + 2.0, s->alpha + 1.0) +
-                 pow(kj, s->alpha + 1.0) -
-                 2.0 * pow(kj + 1.0, s->alpha + 1.0));
+                (s->k_alpha1_cache[m + 2] +
+                 s->k_alpha1_cache[m] -
+                 2.0 * s->k_alpha1_cache[m + 1]);
         }
     }
 }
@@ -426,9 +429,9 @@ static inline void charlton__compute_dct_eigenvalues(charlton_abm_solver *s) {
     memset(kernel, 0, dct_n * sizeof(double));
     for (size_t j = 0; j < N && j < dct_n; ++j) {
         kernel[j] = h_alpha * s->gamma_alpha2 *
-            (pow((double)(j + 2), s->alpha + 1.0) +
-             pow((double)j, s->alpha + 1.0) -
-             2.0 * pow((double)(j + 1), s->alpha + 1.0));
+            (s->k_alpha1_cache[j + 2] +
+             s->k_alpha1_cache[j] -
+             2.0 * s->k_alpha1_cache[j + 1]);
     }
     kernel[0] = h_alpha * s->gamma_alpha2;
 
@@ -455,6 +458,21 @@ static inline int charlton_abm_init(charlton_abm_solver *s, double H, double T,
     s->gamma_alpha1 = 1.0 / tgamma(s->alpha + 1.0);
     s->gamma_alpha2 = 1.0 / tgamma(s->alpha + 2.0);
 
+    /* Precompute pow(t[n], alpha) for n=0..N */
+    s->t_alpha_cache = charlton_alloc_doubles(N + 1);
+    if (!s->t_alpha_cache) return CHARLTON_ERR_ALLOC;
+    s->t_alpha_cache[0] = 0.0;
+    for (size_t i = 1; i <= N; ++i)
+        s->t_alpha_cache[i] = pow(s->h * (double)i, s->alpha);
+
+    /* Precompute pow(k, alpha+1) for k=0..N+2 */
+    s->k_alpha1_cache = charlton_alloc_doubles(N + 3);
+    if (!s->k_alpha1_cache) { charlton_aligned_free(s->t_alpha_cache); return CHARLTON_ERR_ALLOC; }
+    double ap1 = s->alpha + 1.0;
+    s->k_alpha1_cache[0] = 0.0;
+    for (size_t i = 1; i <= N + 2; ++i)
+        s->k_alpha1_cache[i] = pow((double)i, ap1);
+
     size_t weight_size = N * (N + 1) / 2;
     s->a_weights = charlton_alloc_doubles(weight_size);
     if (!s->a_weights) return CHARLTON_ERR_ALLOC;
@@ -467,6 +485,8 @@ static inline int charlton_abm_init(charlton_abm_solver *s, double H, double T,
 
 static inline void charlton_abm_free(charlton_abm_solver *s) {
     charlton_aligned_free(s->a_weights);
+    charlton_aligned_free(s->t_alpha_cache);
+    charlton_aligned_free(s->k_alpha1_cache);
     charlton_aligned_free(s->dct_evals);
     charlton_aligned_free(s->dct_aux_buf);
     if (s->fft_aux) notorious_fft_free_aux(s->fft_aux);
@@ -476,9 +496,8 @@ static inline void charlton_abm_free(charlton_abm_solver *s) {
 static inline charlton_cmplx charlton__asymptotic_term(const charlton_abm_solver *s,
                                                         charlton_cmplx u, size_t n,
                                                         double scale) {
-    double t_n = s->h * (double)n;
     charlton_cmplx u_term = u * u - CHARLTON_I * u;
-    return -0.5 * u_term * pow(t_n, s->alpha) * s->gamma_alpha1 / scale;
+    return -0.5 * u_term * s->t_alpha_cache[n] * s->gamma_alpha1 / scale;
 }
 
 static inline charlton_cmplx charlton__F_as1(const charlton_abm_solver *s,
@@ -560,11 +579,14 @@ static inline charlton_cmplx charlton_abm_solve_single(const charlton_abm_solver
             h0_tilde += s->a_weights[j + (n - j) * (n - j + 1) / 2] * F_history[j];
         }
 
-        /* Picard iterations */
+        /* Picard iterations with early convergence check */
         charlton_cmplx h1_new = h0_tilde;
         for (int p = 0; p < n_picard; ++p) {
+            charlton_cmplx h1_old = h1_new;
             charlton_cmplx F_pred = charlton__F_as1(s, u, h_as_tilde, h1_new, scale);
             h1_new = h0_tilde + s->a_weights[(n + 1) * (n + 2) / 2 - 1] * F_pred;
+            if (charlton_cabs(h1_new - h1_old) < 1e-14 * (1.0 + charlton_cabs(h1_new)))
+                break;
         }
 
         h1_tilde[n + 1] = h1_new;
@@ -586,7 +608,7 @@ static inline int charlton_abm_solve_batch(const charlton_abm_solver *s,
                                            charlton_cmplx *result) {
     #pragma omp parallel for schedule(dynamic) if(batch_size > 4)
     for (size_t b = 0; b < batch_size; ++b) {
-        result[b] = charlton_abm_solve_single(s, u_batch[b], 3);
+        result[b] = charlton_abm_solve_single(s, u_batch[b], 8);
     }
     return CHARLTON_OK;
 }
@@ -1069,12 +1091,12 @@ static inline double charlton__sinh_sum_neon(const charlton_cached_cf *cf,
 
 #endif /* NEON */
 
-/* Scalar fallback (always available) */
+/* Scalar fallback (always available) — with Richardson extrapolation */
 static inline double charlton__sinh_sum_scalar(const charlton_cached_cf *cf,
                                                 double x_re, double x_im,
                                                 double K, double df, double V0) {
     size_t N = cf->n_quad;
-    double s_re = 0.0;
+    double s_full = 0.0, s_half = 0.0;
     for (size_t j = 0; j < N; ++j) {
         charlton_cmplx xi = cf->u_re[j] + CHARLTON_I * cf->u_im[j];
         charlton_cmplx exp_arg = (cf->phi_re[j] + CHARLTON_I * cf->phi_im[j]) * V0 +
@@ -1084,9 +1106,13 @@ static inline double charlton__sinh_sum_scalar(const charlton_cached_cf *cf,
         charlton_cmplx cosh_t = cf->cosh_re[j] + CHARLTON_I * cf->cosh_im[j];
         charlton_cmplx g = cfv * cosh_t / denom_val;
         double w = (j == 0) ? 0.5 : 1.0;
-        s_re += w * charlton_creal(g);
+        double val = w * charlton_creal(g);
+        s_full += val;
+        if (j % 2 == 0) s_half += val;
     }
-    return -cf->sp.b * cf->sp.zeta * K * df / M_PI * s_re;
+    /* Richardson extrapolation: (4*S_full - S_half) / 3 */
+    double s_rich = (4.0 * s_full - s_half) / 3.0;
+    return -cf->sp.b * cf->sp.zeta * K * df / M_PI * s_rich;
 }
 
 /* Dispatch to best available SIMD */
@@ -1124,14 +1150,9 @@ static inline double charlton__price_put_from_cache(const charlton_cached_cf *ca
 
     if (!isfinite(raw)) raw = 0.0;
 
-    /* Deep ITM put correction */
+    /* Numerical noise floor */
     double intrinsic = K * exp(-p->r * p->T) - p->S0 * exp(-p->q * p->T);
     if (intrinsic < 0.0) intrinsic = 0.0;
-    if (K > 1.3 * p->S0 && raw < 0.5 * intrinsic) {
-        raw = intrinsic * 0.995;
-    }
-
-    /* Numerical noise floor */
     if (raw < 0.0 && raw > -1e-8) raw = 1e-12;
     else if (raw < -1e-8) raw = intrinsic > 0.0 ? intrinsic : 0.0;
 
@@ -1219,10 +1240,11 @@ static inline double charlton_price_put_bootstrap(const charlton_model_params *p
 static inline double charlton_implied_volatility(double price, double S0, double K,
                                                   double T, double r, int is_call) {
     double sigma = 0.2;
-    for (int i = 0; i < 100; ++i) {
-        if (sigma <= 0.0) sigma = 1e-4;
-        double d1 = (log(S0 / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt(T));
-        double d2 = d1 - sigma * sqrt(T);
+    double sigma_lo = 0.01, sigma_hi = 5.0;
+    double sqrtT = sqrt(T);
+    for (int i = 0; i < 50; ++i) {
+        double d1 = (log(S0 / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT);
+        double d2 = d1 - sigma * sqrtT;
         double nd1 = 0.5 * (1.0 + erf(d1 / sqrt(2.0)));
         double nd2 = 0.5 * (1.0 + erf(d2 / sqrt(2.0)));
         double bs_price;
@@ -1230,13 +1252,22 @@ static inline double charlton_implied_volatility(double price, double S0, double
             bs_price = S0 * nd1 - K * exp(-r * T) * nd2;
         else
             bs_price = K * exp(-r * T) * (1.0 - nd2) - S0 * (1.0 - nd1);
-        double vega_bs = S0 * sqrt(T) * exp(-d1 * d1 / 2.0) / sqrt(2.0 * M_PI);
         double diff = bs_price - price;
-        if (fabs(diff) < 1e-12) return sigma;
-        sigma -= diff / (vega_bs + 1e-10);
-        if (sigma < 1e-4) sigma = 1e-4;
-        if (sigma > 5.0) sigma = 5.0;
+        if (fabs(diff) < 1e-10) break;
+
+        /* Update bracket */
+        if (diff > 0.0) sigma_hi = sigma;
+        else            sigma_lo = sigma;
+
+        /* Newton step with bisection fallback */
+        double vega_bs = S0 * sqrtT * exp(-d1 * d1 / 2.0) / sqrt(2.0 * M_PI);
+        double sigma_new = sigma - diff / vega_bs;
+        if (vega_bs < 1e-12 || sigma_new <= sigma_lo || sigma_new >= sigma_hi)
+            sigma_new = 0.5 * (sigma_lo + sigma_hi);
+        sigma = sigma_new;
     }
+    if (sigma < 1e-4) sigma = 1e-4;
+    if (sigma > 10.0) sigma = 10.0;
     return sigma;
 }
 
@@ -1312,8 +1343,8 @@ static inline int charlton_greeks(const charlton_model_params *params, double K,
 
     /* Rho: dP/dr */
     {
-        double h = 1e-6;
-        if (fabs(params->r) > 1e-3) h = fabs(params->r) * 1e-3 + 1e-6;
+        double r_scale = fabs(params->r) > 0.01 ? fabs(params->r) : 0.01;
+        double h = r_scale * 1e-4;
         p_up = *params; p_up.r = params->r + h;
         p_dn = *params; p_dn.r = params->r - h;
         double pu = charlton_price_put(&p_up, K, CHARLTON_DEFAULT_TOLERANCE);
@@ -1467,18 +1498,6 @@ static inline int charlton_greeks(const charlton_model_params *params, double K,
         double pd = charlton_price_put(&p_dn, K, CHARLTON_DEFAULT_TOLERANCE);
         result->theta_sens = (pu - pd) / (2.0 * h);
     }
-
-    /* Deep strike clamping */
-    if (K > 1.5 * params->S0) {
-        result->delta = -1.0;
-        result->gamma = 0.0;
-    } else if (K < 0.6 * params->S0) {
-        result->delta = 0.0;
-        result->gamma = 0.0;
-    }
-
-    /* Theta sanity */
-    if (fabs(result->theta) > 10.0) result->theta = -0.1;
 
     return CHARLTON_OK;
 }
@@ -1939,7 +1958,7 @@ static inline size_t charlton_generate_test_market_data(
             quotes[idx].T = T;
             quotes[idx].K = K;
             quotes[idx].iv = iv;
-            quotes[idx].is_call = 0;
+            quotes[idx].is_call = 1;
             idx++;
         }
     }
@@ -2079,7 +2098,7 @@ static inline int charlton__cos_cf_coeffs(charlton_cos_workspace *ws,
     for (int k = 0; k < N; ++k) {
         double u_k = (double)k * M_PI / ba;
         charlton_cmplx u = CHARLTON_CMPLX(u_k, 0.0);
-        charlton_cmplx psi = charlton_abm_solve_single(&solver, u, 3);
+        charlton_cmplx psi = charlton_abm_solve_single(&solver, u, 8);
         /* CF of log-return over dt: phi(u_k) = exp(psi * V0 + i*u*drift) */
         charlton_cmplx log_cf = psi * p->V0 + CHARLTON_I * u_k * drift;
         charlton_cmplx phi_val = charlton_cexp(log_cf);
@@ -2687,7 +2706,7 @@ static inline int charlton_test_abm_basic(void) {
     int rc = charlton_abm_init(&solver, 0.12, 1.0, 256, 0.1, 0.3156, 0.331, -0.681);
     if (rc != CHARLTON_OK) return 1;
     charlton_cmplx u = 1.0 + 0.5 * CHARLTON_I;
-    charlton_cmplx phi = charlton_abm_solve_single(&solver, u, 3);
+    charlton_cmplx phi = charlton_abm_solve_single(&solver, u, 8);
     charlton_abm_free(&solver);
     return isfinite(charlton_creal(phi)) && isfinite(charlton_cimag(phi)) ? 0 : 1;
 }

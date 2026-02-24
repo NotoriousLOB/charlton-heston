@@ -85,7 +85,7 @@ TEST_F(ABMSolverTest, SolveBatchMatchesSingle) {
     charlton_abm_solve_batch(&solver, batch, 3, batch_result);
 
     for (int i = 0; i < 3; ++i) {
-        charlton_cmplx single_result = charlton_abm_solve_single(&solver, batch[i], 3);
+        charlton_cmplx single_result = charlton_abm_solve_single(&solver, batch[i], 8);
         EXPECT_NEAR(charlton_creal(batch_result[i]), charlton_creal(single_result), 1e-10);
         EXPECT_NEAR(charlton_cimag(batch_result[i]), charlton_cimag(single_result), 1e-10);
     }
