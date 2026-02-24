@@ -1,7 +1,5 @@
 /**
- * CHARLTON Test Suite
- * 
- * Main test entry point
+ * CHARLTON Test Suite - Main entry point
  */
 
 #include <gtest/gtest.h>

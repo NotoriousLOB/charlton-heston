@@ -1,6 +1,5 @@
-# CHARLTON Tests
+# CHARLTON Tests (GTest C++ calling C API via extern "C")
 
-# Test executable
 add_executable(charlton_tests
     test_main.cpp
     test_abm_solver.cpp
@@ -14,10 +13,9 @@ target_link_libraries(charlton_tests PRIVATE
     GTest::gtest_main
 )
 
-# Register tests with CTest
+target_include_directories(charlton_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 include(GoogleTest)
 gtest_discover_tests(charlton_tests)
-
-# Add test data directory
-configure_file(${CMAKE_CURRENT_SOURCE_DIR}/test_data.hpp 
-               ${CMAKE_CURRENT_BINARY_DIR}/test_data.hpp COPYONLY)

@@ -1,14 +1,16 @@
-# CHARLTON - Conformal Hyperbolic Accelerated Rough Lévy Transform for Option Numerics
-# CMake Build System
+# CHARLTON - Conformal Hyperbolic Accelerated Rough Levy Transform for Option Numerics
+# C99 header-only library with C++17 test/benchmark harness
 
 cmake_minimum_required(VERSION 3.16)
-project(charlton 
-    VERSION 1.0.0
-    DESCRIPTION "High-performance Rough Heston pricing and calibration library"
-    LANGUAGES CXX C
+project(charlton
+    VERSION 2.0.0
+    DESCRIPTION "High-performance C99 Rough Heston pricing and calibration library"
+    LANGUAGES C CXX
 )
 
-# C++ Standard
+# C99 for library code, C++17 for GTest/Google Benchmark
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -17,41 +19,26 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(CHARLTON_BUILD_TESTS "Build tests" ON)
 option(CHARLTON_BUILD_BENCHMARKS "Build benchmarks" ON)
 option(CHARLTON_BUILD_EXAMPLES "Build examples" ON)
-option(CHARLTON_BUILD_PYTHON "Build Python bindings" ON)
+option(CHARLTON_BUILD_PYTHON "Build Python shared library for ctypes" ON)
 option(CHARLTON_ENABLE_OPENMP "Enable OpenMP parallelization" ON)
 option(CHARLTON_ENABLE_SIMD "Enable SIMD optimizations" ON)
-option(CHARLTON_USE_MKL "Use Intel MKL for FFT" OFF)
 
-# Include FetchContent for dependencies
 include(FetchContent)
 
 # ============================================================================
 # Dependencies
 # ============================================================================
 
-# FFTW3 (or MKL)
-if(CHARLTON_USE_MKL)
-    find_package(MKL REQUIRED)
-    add_compile_definitions(USE_MKL)
-else()
-    # Use system FFTW3 (fallback to FetchContent can be added later for systems without it)
-    find_library(FFTW3_LIB fftw3 PATHS /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib)
-    find_path(FFTW3_INCLUDE fftw3.h PATHS /usr/include /usr/local/include)
+# Notorious-FFT (header-only, C API)
+FetchContent_Declare(
+    notorious_fft
+    GIT_REPOSITORY https://github.com/NotoriousLOB/Notorious-FFT.git
+    GIT_TAG master
+    GIT_SHALLOW TRUE
+)
+FetchContent_Populate(notorious_fft)
 
-    if(FFTW3_LIB AND FFTW3_INCLUDE)
-        message(STATUS "Found system FFTW3: ${FFTW3_LIB}")
-        include_directories(${FFTW3_INCLUDE})
-        add_library(fftw3 INTERFACE)
-        target_link_libraries(fftw3 INTERFACE ${FFTW3_LIB})
-        target_include_directories(fftw3 INTERFACE ${FFTW3_INCLUDE})
-    else()
-        message(WARNING "System FFTW3 not found. Install libfftw3-dev or enable CHARLTON_USE_MKL")
-        message(STATUS "TODO: Add FetchContent fallback for systems without FFTW3")
-        message(FATAL_ERROR "FFTW3 required but not found")
-    endif()
-endif()
-
-# Google Test (for tests)
+# Google Test
 if(CHARLTON_BUILD_TESTS)
     FetchContent_Declare(
         googletest
@@ -59,14 +46,11 @@ if(CHARLTON_BUILD_TESTS)
         GIT_TAG v1.14.0
         GIT_SHALLOW TRUE
     )
-    
-    # For Windows: Prevent overriding the parent project's compiler/linker settings
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-    
     FetchContent_MakeAvailable(googletest)
 endif()
 
-# Google Benchmark (for benchmarks)
+# Google Benchmark
 if(CHARLTON_BUILD_BENCHMARKS)
     FetchContent_Declare(
         benchmark
@@ -74,10 +58,8 @@ if(CHARLTON_BUILD_BENCHMARKS)
         GIT_TAG v1.8.3
         GIT_SHALLOW TRUE
     )
-    
     set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
     set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
-    
     FetchContent_MakeAvailable(benchmark)
 endif()
 
@@ -85,99 +67,102 @@ endif()
 # Compiler Flags
 # ============================================================================
 
-# Detect compiler
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|Intel")
-    # Common flags for GCC/Clang/Intel
-    add_compile_options(-Wall -Wextra -Wpedantic)
-    add_compile_options(-O3 -march=native)
-    
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|Intel")
+    add_compile_options(-Wall -Wextra -O3)
+    # -march=native for local builds; remove for portability
+    if(NOT CMAKE_CROSSCOMPILING)
+        add_compile_options(-march=native)
+    endif()
+
     if(CHARLTON_ENABLE_SIMD)
-        # Enable SIMD intrinsics
-        include(CheckCXXCompilerFlag)
-        
-        check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
-        check_cxx_compiler_flag("-mavx512f" COMPILER_SUPPORTS_AVX512)
-        check_cxx_compiler_flag("-mavx512dq" COMPILER_SUPPORTS_AVX512DQ)
-        
+        include(CheckCCompilerFlag)
+        check_c_compiler_flag("-mavx512f" COMPILER_SUPPORTS_AVX512)
+        check_c_compiler_flag("-mavx512dq" COMPILER_SUPPORTS_AVX512DQ)
+        check_c_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+
         if(COMPILER_SUPPORTS_AVX512 AND COMPILER_SUPPORTS_AVX512DQ)
             add_compile_options(-mavx512f -mavx512dq)
-            add_compile_definitions(HAS_AVX512)
             message(STATUS "AVX-512 enabled")
         elseif(COMPILER_SUPPORTS_AVX2)
             add_compile_options(-mavx2 -mfma)
-            add_compile_definitions(HAS_AVX2)
             message(STATUS "AVX2 enabled")
         endif()
-        
-        # ARM NEON
-        check_cxx_compiler_flag("-mfpu=neon" COMPILER_SUPPORTS_NEON)
-        if(COMPILER_SUPPORTS_NEON)
+
+        # ARM NEON (auto-detected on aarch64, flag needed on armv7)
+        check_c_compiler_flag("-mfpu=neon" COMPILER_SUPPORTS_NEON_FLAG)
+        if(COMPILER_SUPPORTS_NEON_FLAG)
             add_compile_options(-mfpu=neon)
-            add_compile_definitions(HAS_NEON)
-            message(STATUS "ARM NEON enabled")
+            message(STATUS "ARM NEON enabled (via flag)")
         endif()
     endif()
-    
+
     if(CHARLTON_ENABLE_OPENMP)
         find_package(OpenMP)
-        if(OpenMP_CXX_FOUND)
-            add_compile_options(${OpenMP_CXX_FLAGS})
-            add_link_options(${OpenMP_CXX_FLAGS})
-            add_compile_definitions(_OPENMP)
+        if(OpenMP_C_FOUND)
             message(STATUS "OpenMP enabled")
         else()
-            message(WARNING "OpenMP not found, parallelization disabled")
+            message(WARNING "OpenMP not found")
         endif()
     endif()
-    
-elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
-    # MSVC flags
+
+elseif(CMAKE_C_COMPILER_ID MATCHES "MSVC")
     add_compile_options(/W4 /O2)
-    
     if(CHARLTON_ENABLE_SIMD)
         add_compile_options(/arch:AVX2)
-        add_compile_definitions(HAS_AVX2)
     endif()
-    
     if(CHARLTON_ENABLE_OPENMP)
         add_compile_options(/openmp)
-        add_compile_definitions(_OPENMP)
     endif()
 endif()
 
 # ============================================================================
-# Library Target
+# Static Library (C99)
 # ============================================================================
 
-# Header-only library interface
-add_library(charlton INTERFACE)
+add_library(charlton STATIC src/charlton_impl.c)
 add_library(charlton::charlton ALIAS charlton)
 
-target_include_directories(charlton INTERFACE
+target_include_directories(charlton PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${notorious_fft_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 
-# Link dependencies
-if(CHARLTON_USE_MKL)
-    target_link_libraries(charlton INTERFACE MKL::MKL)
-else()
-    # Link FFTW3 directly to avoid export issues
-    target_link_libraries(charlton INTERFACE ${FFTW3_LIB})
-    target_include_directories(charlton INTERFACE ${FFTW3_INCLUDE})
-endif()
-
-if(CHARLTON_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
-    target_link_libraries(charlton INTERFACE OpenMP::OpenMP_CXX)
-endif()
-
-# Link math library on Unix
 if(UNIX)
-    target_link_libraries(charlton INTERFACE m)
+    target_link_libraries(charlton PUBLIC m)
+endif()
+
+if(CHARLTON_ENABLE_OPENMP AND OpenMP_C_FOUND)
+    target_link_libraries(charlton PUBLIC OpenMP::OpenMP_C)
 endif()
 
 # ============================================================================
-# Tests
+# Shared Library (for Python ctypes)
+# ============================================================================
+
+if(CHARLTON_BUILD_PYTHON)
+    add_library(charlton_shared SHARED src/charlton_shlib.c)
+
+    target_include_directories(charlton_shared PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${notorious_fft_SOURCE_DIR}/include>
+    )
+
+    if(UNIX)
+        target_link_libraries(charlton_shared PUBLIC m)
+    endif()
+    if(CHARLTON_ENABLE_OPENMP AND OpenMP_C_FOUND)
+        target_link_libraries(charlton_shared PUBLIC OpenMP::OpenMP_C)
+    endif()
+
+    set_target_properties(charlton_shared PROPERTIES
+        C_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+endif()
+
+# ============================================================================
+# Subdirectories
 # ============================================================================
 
 if(CHARLTON_BUILD_TESTS)
@@ -185,28 +170,12 @@ if(CHARLTON_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-# ============================================================================
-# Benchmarks
-# ============================================================================
-
 if(CHARLTON_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif()
 
-# ============================================================================
-# Examples
-# ============================================================================
-
 if(CHARLTON_BUILD_EXAMPLES)
     add_subdirectory(examples)
-endif()
-
-# ============================================================================
-# Python Bindings
-# ============================================================================
-
-if(CHARLTON_BUILD_PYTHON)
-    add_subdirectory(python)
 endif()
 
 # ============================================================================
@@ -217,6 +186,7 @@ include(GNUInstallDirs)
 
 install(TARGETS charlton
     EXPORT charlton-targets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
 install(EXPORT charlton-targets
@@ -225,11 +195,10 @@ install(EXPORT charlton-targets
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/charlton
 )
 
-install(FILES include/charlton.hpp
+install(FILES include/charlton.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
-# Create config file
 include(CMakePackageConfigHelpers)
 
 configure_package_config_file(
@@ -251,19 +220,20 @@ install(FILES
 )
 
 # ============================================================================
-# Print Configuration
+# Summary
 # ============================================================================
 
 message(STATUS "")
 message(STATUS "CHARLTON Configuration:")
 message(STATUS "  Version: ${PROJECT_VERSION}")
 message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
+message(STATUS "  C Standard: ${CMAKE_C_STANDARD}")
+message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD} (tests/benchmarks only)")
 message(STATUS "  Tests: ${CHARLTON_BUILD_TESTS}")
 message(STATUS "  Benchmarks: ${CHARLTON_BUILD_BENCHMARKS}")
 message(STATUS "  Examples: ${CHARLTON_BUILD_EXAMPLES}")
-message(STATUS "  Python Bindings: ${CHARLTON_BUILD_PYTHON}")
+message(STATUS "  Python ctypes: ${CHARLTON_BUILD_PYTHON}")
 message(STATUS "  OpenMP: ${CHARLTON_ENABLE_OPENMP}")
 message(STATUS "  SIMD: ${CHARLTON_ENABLE_SIMD}")
-message(STATUS "  MKL: ${CHARLTON_USE_MKL}")
+message(STATUS "  FFT: Notorious-FFT (auto-fetched)")
 message(STATUS "")

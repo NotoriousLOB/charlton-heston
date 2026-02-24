@@ -51,7 +51,20 @@
 #define SIMD_WIDTH 1
 #endif
 
-#include <fftw3.h>
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define HAS_NEON 1
+#if SIMD_WIDTH == 1
+#undef SIMD_WIDTH
+#define SIMD_WIDTH 2
+#endif
+#endif
+
+#ifdef CHARLTON_IMPLEMENTATION
+#define NOTORIOUS_FFT_IMPLEMENTATION
+#endif
+#include "notorious_fft.h"
+#include "notorious_fft.hpp"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

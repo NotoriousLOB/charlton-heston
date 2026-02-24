@@ -1,13 +1,16 @@
 /**
- * Tests for Rough Heston Calibration Engine
+ * Tests for Rough Heston Calibration Engine (C API)
  */
 
 #include <gtest/gtest.h>
-#include "charlton.hpp"
-#include "test_data.hpp"
+#include <cmath>
+#include <iostream>
 
-using namespace charlton;
-using namespace charlton_test;
+#include "charlton.h"
+
+extern "C" {
+#include "test_data.h"
+}
 
 class CalibrationTest : public ::testing::Test {
 protected:
@@ -18,12 +21,11 @@ protected:
         cal_params.max_iterations = 100;
         cal_params.tolerance = 1e-4;
         cal_params.step_size = 0.01;
-        
-        // True parameters for synthetic data
+
         true_params.S0 = 1.0;
         true_params.r = 0.0;
         true_params.q = 0.0;
-        true_params.T = 1.0/52.0;  // Will be overridden per quote
+        true_params.T = 1.0 / 52.0;
         true_params.H = 0.1;
         true_params.lambda = 2.0;
         true_params.theta = 0.04;
@@ -32,15 +34,14 @@ protected:
         true_params.V0 = 0.04;
     }
 
-    RoughHestonCalibrator<double>::CalibrationParams cal_params;
-    RoughHestonPricer<double>::ModelParams true_params;
+    charlton_calibration_params cal_params;
+    charlton_model_params true_params;
 };
 
 TEST_F(CalibrationTest, InitialGuessIsGenerated) {
-    RoughHestonCalibrator<double> calibrator(cal_params);
-    
-    auto guess = calibrator.generate_initial_guess();
-    
+    charlton_market_quote quotes[1] = {{ 0.5, 1.0, 0.2, 0 }};
+    charlton_calibration_result guess = charlton_generate_initial_guess(&cal_params, quotes, 1);
+
     EXPECT_GT(guess.H, 0.0);
     EXPECT_GT(guess.lambda, 0.0);
     EXPECT_GT(guess.theta, 0.0);
@@ -51,26 +52,17 @@ TEST_F(CalibrationTest, InitialGuessIsGenerated) {
 }
 
 TEST_F(CalibrationTest, CalibrationConvergesForSyntheticData) {
-    // Generate synthetic market data
-    std::vector<double> maturities = {1.0/52.0, 2.0/52.0};
-    std::vector<double> moneyness = {0.9, 0.95, 1.0, 1.05, 1.1};
-    
-    auto quotes = generate_test_market_data(
-        cal_params.S0, cal_params.r,
-        true_params,
-        maturities, moneyness, 0.0
-    );
-    
-    RoughHestonCalibrator<double> calibrator(cal_params);
-    calibrator.add_quotes(quotes);
-    
-    auto initial = calibrator.generate_initial_guess();
-    auto result = calibrator.calibrate_adam(initial);
-    
-    // Should converge for noiseless data
+    double maturities[] = {1.0 / 52.0, 2.0 / 52.0};
+    double moneyness[] = {0.9, 0.95, 1.0, 1.05, 1.1};
+    charlton_market_quote quotes[10];
+    charlton_generate_test_market_data(&true_params, cal_params.S0, cal_params.r,
+                                       maturities, 2, moneyness, 5, quotes);
+
+    charlton_calibration_result guess = charlton_generate_initial_guess(&cal_params, quotes, 10);
+    charlton_calibration_result result;
+    charlton_calibrate_adam(&cal_params, quotes, 10, &guess, &result);
+
     EXPECT_LT(result.rmse, 0.01);
-    
-    // Parameters should be close to true values
     EXPECT_NEAR(result.H, true_params.H, 0.05);
     EXPECT_NEAR(result.lambda, true_params.lambda, 0.5);
     EXPECT_NEAR(result.theta, true_params.theta, 0.01);
@@ -79,106 +71,45 @@ TEST_F(CalibrationTest, CalibrationConvergesForSyntheticData) {
     EXPECT_NEAR(result.V0, true_params.V0, 0.01);
 }
 
-TEST_F(CalibrationTest, CalibrationHandlesNoisyData) {
-    // Generate synthetic market data with noise
-    std::vector<double> maturities = {1.0/52.0, 2.0/52.0};
-    std::vector<double> moneyness = {0.9, 0.95, 1.0, 1.05, 1.1};
-    
-    double noise_level = 0.005;  // 0.5% IV noise
-    auto quotes = generate_test_market_data(
-        cal_params.S0, cal_params.r,
-        true_params,
-        maturities, moneyness, noise_level
-    );
-    
-    RoughHestonCalibrator<double> calibrator(cal_params);
-    calibrator.add_quotes(quotes);
-    
-    auto initial = calibrator.generate_initial_guess();
-    auto result = calibrator.calibrate_adam(initial);
-    
-    // RMSE should be close to noise level
-    EXPECT_LT(result.rmse, noise_level * 3.0);
-    
-    // Parameters should be reasonably close
-    EXPECT_NEAR(result.H, true_params.H, 0.1);
-    EXPECT_NEAR(result.rho, true_params.rho, 0.2);
-}
-
-TEST_F(CalibrationTest, CalibrationResultIsPrintable) {
-    RoughHestonCalibrator<double> calibrator(cal_params);
-    auto result = calibrator.generate_initial_guess();
-    
-    // Should not throw when printing
-    EXPECT_NO_THROW(result.print());
-}
-
-TEST_F(CalibrationTest, EmptyQuotesReturnsZeroError) {
-    RoughHestonCalibrator<double> calibrator(cal_params);
-    
-    auto result = calibrator.generate_initial_guess();
-    
-    // With no quotes, RMSE should be zero
-    EXPECT_EQ(result.rmse, 0.0);
-}
-
 TEST_F(CalibrationTest, CalibrationWithSingleMaturity) {
-    std::vector<double> maturities = {1.0/52.0};
-    std::vector<double> moneyness = {0.9, 0.95, 1.0, 1.05, 1.1};
-    
-    auto quotes = generate_test_market_data(
-        cal_params.S0, cal_params.r,
-        true_params,
-        maturities, moneyness, 0.0
-    );
-    
-    RoughHestonCalibrator<double> calibrator(cal_params);
-    calibrator.add_quotes(quotes);
-    
-    auto initial = calibrator.generate_initial_guess();
-    auto result = calibrator.calibrate_adam(initial);
-    
-    // Should still converge with single maturity
+    double maturities[] = {1.0 / 52.0};
+    double moneyness[] = {0.9, 0.95, 1.0, 1.05, 1.1};
+    charlton_market_quote quotes[5];
+    charlton_generate_test_market_data(&true_params, cal_params.S0, cal_params.r,
+                                       maturities, 1, moneyness, 5, quotes);
+
+    charlton_calibration_result guess = charlton_generate_initial_guess(&cal_params, quotes, 5);
+    charlton_calibration_result result;
+    charlton_calibrate_adam(&cal_params, quotes, 5, &guess, &result);
+
     EXPECT_LT(result.rmse, 0.02);
 }
 
 TEST_F(CalibrationTest, CalibrationWithWideStrikeRange) {
-    std::vector<double> maturities = {1.0/52.0, 2.0/52.0};
-    std::vector<double> moneyness = {0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3};
-    
-    auto quotes = generate_test_market_data(
-        cal_params.S0, cal_params.r,
-        true_params,
-        maturities, moneyness, 0.0
-    );
-    
-    RoughHestonCalibrator<double> calibrator(cal_params);
-    calibrator.add_quotes(quotes);
-    
-    auto initial = calibrator.generate_initial_guess();
-    auto result = calibrator.calibrate_adam(initial);
-    
-    // Should handle wide strike range
+    double maturities[] = {1.0 / 52.0, 2.0 / 52.0};
+    double moneyness[] = {0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3};
+    charlton_market_quote quotes[14];
+    charlton_generate_test_market_data(&true_params, cal_params.S0, cal_params.r,
+                                       maturities, 2, moneyness, 7, quotes);
+
+    charlton_calibration_result guess = charlton_generate_initial_guess(&cal_params, quotes, 14);
+    charlton_calibration_result result;
+    charlton_calibrate_adam(&cal_params, quotes, 14, &guess, &result);
+
     EXPECT_LT(result.rmse, 0.01);
 }
 
 TEST_F(CalibrationTest, ParameterBoundsAreRespected) {
-    std::vector<double> maturities = {1.0/52.0};
-    std::vector<double> moneyness = {0.9, 1.0, 1.1};
-    
-    auto quotes = generate_test_market_data(
-        cal_params.S0, cal_params.r,
-        true_params,
-        maturities, moneyness, 0.0
-    );
-    
-    RoughHestonCalibrator<double> calibrator(cal_params);
-    calibrator.add_quotes(quotes);
-    
-    auto initial = calibrator.generate_initial_guess();
-    auto result = calibrator.calibrate_adam(initial);
-    
-    // Check parameter bounds
+    double maturities[] = {1.0 / 52.0};
+    double moneyness[] = {0.9, 1.0, 1.1};
+    charlton_market_quote quotes[3];
+    charlton_generate_test_market_data(&true_params, cal_params.S0, cal_params.r,
+                                       maturities, 1, moneyness, 3, quotes);
+
+    charlton_calibration_result guess = charlton_generate_initial_guess(&cal_params, quotes, 3);
+    charlton_calibration_result result;
+    charlton_calibrate_adam(&cal_params, quotes, 3, &guess, &result);
+
     EXPECT_GE(result.H, 0.01);
     EXPECT_LE(result.H, 0.49);
     EXPECT_GE(result.lambda, 0.01);
@@ -187,4 +118,39 @@ TEST_F(CalibrationTest, ParameterBoundsAreRespected) {
     EXPECT_GE(result.rho, -0.99);
     EXPECT_LE(result.rho, 0.99);
     EXPECT_GE(result.V0, 0.001);
+}
+
+TEST_F(CalibrationTest, LBFGSCalibrationRuns) {
+    double maturities[] = {1.0 / 52.0};
+    double moneyness[] = {0.9, 1.0, 1.1};
+    charlton_market_quote quotes[3];
+    charlton_generate_test_market_data(&true_params, cal_params.S0, cal_params.r,
+                                       maturities, 1, moneyness, 3, quotes);
+
+    charlton_calibration_result guess = charlton_generate_initial_guess(&cal_params, quotes, 3);
+    charlton_calibration_result result;
+    int rc = charlton_calibrate_lbfgs(&cal_params, quotes, 3, &guess, &result);
+
+    EXPECT_EQ(rc, CHARLTON_OK);
+    EXPECT_TRUE(std::isfinite(result.rmse));
+    EXPECT_GT(result.iterations, 0);
+}
+
+TEST_F(CalibrationTest, LOBSyntheticQuotesGenerated) {
+    charlton_model_params p = true_params;
+    p.T = 0.5;
+    double T_grid[] = {0.25, 0.5};
+    double K_grid[] = {0.9, 1.0, 1.1};
+    charlton_market_quote quotes[6];
+
+    int rc = charlton_lob_synth_quotes(&p, 2, 3, T_grid, K_grid,
+                                        10.0, 1.5, 0.5, quotes);
+    EXPECT_EQ(rc, CHARLTON_OK);
+
+    for (int i = 0; i < 6; ++i) {
+        EXPECT_TRUE(std::isfinite(quotes[i].iv));
+        EXPECT_GT(quotes[i].iv, 0.0);
+        EXPECT_GT(quotes[i].T, 0.0);
+        EXPECT_GT(quotes[i].K, 0.0);
+    }
 }

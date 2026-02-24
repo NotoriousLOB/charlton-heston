@@ -26,8 +26,9 @@ A high-performance C++ library for pricing and calibration in the **Rough Heston
 
 - C++17 compatible compiler (GCC 8+, Clang 7+, MSVC 2019+)
 - CMake 3.16+
-- FFTW3 (auto-fetched if not found)
-- Optional: OpenMP, Intel MKL
+- Optional: OpenMP
+
+All other dependencies (Notorious-FFT, GoogleTest, Google Benchmark) are auto-fetched via CMake FetchContent.
 
 ### Build
 
