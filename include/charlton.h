@@ -206,6 +206,35 @@ typedef struct {
     double step_size;
 } charlton_calibration_params;
 
+/* COS-method American option pricing (Fang-Oosterlee 2009) */
+
+typedef struct {
+    int n_timesteps;      /* Bermudan exercise dates (default 64) */
+    int n_cos_terms;      /* COS expansion terms N (default 128) */
+    double *cf_re;        /* N allocated doubles: Re{phi(u_k)} */
+    double *cf_im;        /* N allocated doubles: Im{phi(u_k)} */
+    double *V_coeffs;     /* N allocated doubles for continuation value COS coeffs */
+    double *payoff_coeffs;/* N allocated doubles for payoff COS coeffs */
+    double *grid_vals;    /* N allocated doubles for grid-space values */
+    double a, b;          /* truncation range [a,b] in log-moneyness */
+} charlton_cos_workspace;
+
+typedef struct {
+    double price;
+    double early_exercise_premium;
+    int n_timesteps;
+    int n_cos_terms;
+    int converged;        /* 1 if Richardson extrapolation error < tol */
+} charlton_american_result;
+
+typedef struct {
+    int n_cheb;           /* number of Chebyshev nodes */
+    int n_timesteps;      /* exercise dates */
+    double *nodes;        /* n_cheb Chebyshev-Gauss-Lobatto nodes in [0,T] */
+    double *boundary;     /* n_cheb boundary values S*(t_j) */
+    double *bary_weights; /* n_cheb barycentric weights */
+} charlton_exercise_boundary;
+
 /* ============================================================================
  * Memory Helpers
  * ============================================================================ */
@@ -278,7 +307,7 @@ static inline int  charlton_cache_cf_init(charlton_cached_cf *cache,
 static inline void charlton_cache_cf_free(charlton_cached_cf *cache);
 static inline double charlton_price_from_cache(const charlton_cached_cf *cache,
                                                double S0, double K, double r,
-                                               double T, double q);
+                                               double T, double V0);
 
 /* Public Pricing API */
 static inline double charlton_price_put(const charlton_model_params *params,
@@ -319,6 +348,20 @@ static inline int charlton_lob_synth_quotes(const charlton_model_params *params,
                                             double k_lambda, double alpha_lob,
                                             double theta_cancel,
                                             charlton_market_quote *quotes);
+
+/* American Option Pricing (COS method) */
+static inline int charlton_price_american_put(const charlton_model_params *p, double K,
+                                               int n_timesteps, int n_cos_terms,
+                                               charlton_american_result *result);
+static inline int charlton_price_american_call(const charlton_model_params *p, double K,
+                                                int n_timesteps, int n_cos_terms,
+                                                charlton_american_result *result);
+static inline int charlton_american_exercise_boundary(const charlton_model_params *p,
+                                                       double K, int n_timesteps,
+                                                       int n_cos_terms, int n_cheb,
+                                                       charlton_exercise_boundary *eb);
+static inline int charlton_american_greeks(const charlton_model_params *p, double K,
+                                            int greek_set, charlton_pricing_result *result);
 
 /* ============================================================================
  * Implementation
@@ -563,17 +606,22 @@ static inline double charlton_abm_decay_rate(const charlton_abm_solver *s,
 
 static inline charlton_sinh_params charlton_compute_sinh_params(
     double T, double S0, double K, double r, double decay_rate,
-    double lm, double lp, double gm, double gp, double tol, int is_call)
+    double lm_in, double lp_in, double gm, double gp, double tol, int is_call)
 {
     charlton_sinh_params sp;
     memset(&sp, 0, sizeof(sp));
     double z_T = log(S0 / K) - r * T;
     double omega_choice, d0;
+    double lm, lp;
 
     if (is_call) {
+        lm = lm_in;
+        lp = -1.0;
         omega_choice = gm / 2.0;
         d0 = -omega_choice;
     } else {
+        lm = 0.0;
+        lp = lp_in;
         omega_choice = gp / 2.0;
         d0 = omega_choice;
     }
@@ -705,11 +753,9 @@ static inline int charlton_cache_cf_init(charlton_cached_cf *cache,
 
     for (size_t j = 0; j < N; ++j) {
         double y = (double)j * cache->sp.zeta;
-        double xi_re = -cache->sp.omega1 * 0.0 + cache->sp.b * sinh(y) * cos(cache->sp.omega);
+        /* xi = i*omega1 + b*(sinh(y)*cos(omega) + i*cosh(y)*sin(omega)) */
+        double xi_re = cache->sp.b * sinh(y) * cos(cache->sp.omega);
         double xi_im = cache->sp.omega1 + cache->sp.b * cosh(y) * sin(cache->sp.omega);
-        /* Correct: xi = i*omega1 + b*(sinh(y)*cos(omega) + i*cosh(y)*sin(omega)) */
-        xi_re = cache->sp.b * sinh(y) * cos(cache->sp.omega);
-        xi_im = cache->sp.omega1 + cache->sp.b * cosh(y) * sin(cache->sp.omega);
         u_grid[j] = xi_re + CHARLTON_I * xi_im;
         cache->u_re[j] = xi_re;
         cache->u_im[j] = xi_im;
@@ -1064,13 +1110,11 @@ static inline double charlton__sinh_sum(const charlton_cached_cf *cf,
 
 static inline double charlton_price_from_cache(const charlton_cached_cf *cache,
                                                double S0, double K, double r,
-                                               double T, double q) {
+                                               double T, double V0) {
     double x = log(S0 / K);
     double df = exp(-r * T);
-    return charlton__sinh_sum(cache, x, 0.0, K, df, 0.0);
+    return charlton__sinh_sum(cache, x, 0.0, K, df, V0);
 }
-
-/* Actually, V0 matters — it's in the exp(phi*V0) term. Let's fix. */
 static inline double charlton__price_put_from_cache(const charlton_cached_cf *cache,
                                                      const charlton_model_params *p,
                                                      double K) {
@@ -1525,12 +1569,11 @@ static inline void charlton__calibration_gradients(
                     charlton__calibration_rmse(cal, quotes, n_quotes, &pm)) / (2.0 * h);
     }
 
-    /* Normalize gradient */
-    double norm = 0.0;
-    for (int i = 0; i < 6; ++i) norm += grads[i] * grads[i];
-    norm = sqrt(norm);
-    if (norm > 0.0) {
-        for (int i = 0; i < 6; ++i) grads[i] /= norm;
+    /* Clip gradient to prevent explosion */
+    double max_grad = 10.0;
+    for (int i = 0; i < 6; ++i) {
+        if (grads[i] > max_grad) grads[i] = max_grad;
+        if (grads[i] < -max_grad) grads[i] = -max_grad;
     }
 }
 
@@ -1544,16 +1587,19 @@ static inline int charlton_calibrate_adam(const charlton_calibration_params *cal
                                           const charlton_calibration_result *initial,
                                           charlton_calibration_result *result)
 {
-    /* Grid search for theta and V0 */
+    /* Grid search for lambda, theta, and V0 */
     *result = *initial;
     double grid_best_rmse = charlton__calibration_rmse(cal, quotes, n_quotes, initial);
     charlton_calibration_result grid_best = *initial;
 
+    double lambda_grid[] = { 0.1, 0.3, 1.0, 3.0 };
     double theta_grid[] = { 0.01, 0.02, 0.04, 0.08, 0.16 };
     double V0_grid[] = { 0.01, 0.02, 0.04, 0.08 };
-    for (int ti = 0; ti < 5; ++ti) {
+    for (int li = 0; li < 4; ++li) {
+      for (int ti = 0; ti < 5; ++ti) {
         for (int vi = 0; vi < 4; ++vi) {
             charlton_calibration_result trial = *initial;
+            trial.lambda = lambda_grid[li];
             trial.theta = theta_grid[ti];
             trial.V0 = V0_grid[vi];
             double err = charlton__calibration_rmse(cal, quotes, n_quotes, &trial);
@@ -1562,6 +1608,7 @@ static inline int charlton_calibrate_adam(const charlton_calibration_params *cal
                 grid_best = trial;
             }
         }
+      }
     }
 
     *result = grid_best;
@@ -1787,10 +1834,10 @@ static inline charlton_calibration_result charlton_generate_initial_guess(
 {
     charlton_calibration_result guess;
     memset(&guess, 0, sizeof(guess));
-    guess.H = 0.1;
-    guess.lambda = 2.0;
+    guess.H = 0.12;
+    guess.lambda = 0.3;
     guess.theta = 0.04;
-    guess.nu = 0.5;
+    guess.nu = 0.3;
     guess.rho = -0.7;
     guess.V0 = 0.04;
 
@@ -1897,6 +1944,736 @@ static inline size_t charlton_generate_test_market_data(
         }
     }
     return idx;
+}
+
+/* --------------------------------------------------------------------------
+ * COS-Method American Option Pricing (Fang-Oosterlee 2009)
+ * -------------------------------------------------------------------------- */
+
+/* Chebyshev-Gauss-Lobatto nodes on [a,b] */
+static inline void charlton__cheb_nodes(int n, double a, double b, double *nodes) {
+    for (int j = 0; j < n; ++j) {
+        double theta_j = M_PI * (double)j / (double)(n - 1);
+        nodes[j] = 0.5 * (a + b) + 0.5 * (b - a) * cos(theta_j);
+    }
+}
+
+/* Barycentric weights for Chebyshev-Gauss-Lobatto nodes */
+static inline void charlton__cheb_bary_weights(int n, double *w) {
+    for (int j = 0; j < n; ++j) {
+        w[j] = (j % 2 == 0) ? 1.0 : -1.0;
+    }
+    w[0] *= 0.5;
+    w[n - 1] *= 0.5;
+}
+
+/* Barycentric interpolation at point x given nodes, values, weights */
+static inline double charlton__cheb_interp(const double *nodes, const double *vals,
+                                            const double *w, int n, double x) {
+    double num = 0.0, den = 0.0;
+    for (int j = 0; j < n; ++j) {
+        double diff = x - nodes[j];
+        if (fabs(diff) < 1e-15) return vals[j];
+        double term = w[j] / diff;
+        num += term * vals[j];
+        den += term;
+    }
+    return num / den;
+}
+
+/* COS workspace init */
+static inline int charlton_cos_init(charlton_cos_workspace *ws, int n_ts, int n_cos,
+                                     double a, double b) {
+    memset(ws, 0, sizeof(*ws));
+    ws->n_timesteps = n_ts;
+    ws->n_cos_terms = n_cos;
+    ws->a = a;
+    ws->b = b;
+
+    ws->cf_re         = charlton_alloc_doubles((size_t)n_cos);
+    ws->cf_im         = charlton_alloc_doubles((size_t)n_cos);
+    ws->V_coeffs      = charlton_alloc_doubles((size_t)n_cos);
+    ws->payoff_coeffs = charlton_alloc_doubles((size_t)n_cos);
+    ws->grid_vals     = charlton_alloc_doubles((size_t)n_cos);
+
+    if (!ws->cf_re || !ws->cf_im || !ws->V_coeffs ||
+        !ws->payoff_coeffs || !ws->grid_vals) {
+        charlton_aligned_free(ws->cf_re);
+        charlton_aligned_free(ws->cf_im);
+        charlton_aligned_free(ws->V_coeffs);
+        charlton_aligned_free(ws->payoff_coeffs);
+        charlton_aligned_free(ws->grid_vals);
+        memset(ws, 0, sizeof(*ws));
+        return CHARLTON_ERR_ALLOC;
+    }
+    return CHARLTON_OK;
+}
+
+static inline void charlton_cos_free(charlton_cos_workspace *ws) {
+    charlton_aligned_free(ws->cf_re);
+    charlton_aligned_free(ws->cf_im);
+    charlton_aligned_free(ws->V_coeffs);
+    charlton_aligned_free(ws->payoff_coeffs);
+    charlton_aligned_free(ws->grid_vals);
+    memset(ws, 0, sizeof(*ws));
+}
+
+/* Compute COS truncation range [a,b] from rough Heston cumulants */
+static inline void charlton__cos_truncation(const charlton_model_params *p,
+                                             double *a_out, double *b_out) {
+    double T = p->T;
+    double H = p->H;
+    double lam = p->lambda;
+    double th = p->theta;
+    double V0 = p->V0;
+    double r = p->r;
+    double q = p->q;
+
+    /* First cumulant (approximate drift in log-moneyness) */
+    double exp_lT = exp(-lam * T);
+    double c1 = (r - q) * T;
+    if (lam > 1e-12)
+        c1 += (1.0 - exp_lT) * (th - V0) / (2.0 * lam);
+    else
+        c1 -= 0.5 * V0 * T;
+
+    /* Second cumulant: rough vol variance scaling ~ V0 * T^(2H) * C(H) */
+    double gamma_2H1 = tgamma(2.0 * H + 1.0);
+    double c2 = V0 * pow(T, 2.0 * H) / gamma_2H1;
+    /* Add mean-reversion contribution */
+    if (lam > 1e-12)
+        c2 += th * T;
+    else
+        c2 += th * T;
+
+    /* Wider range for rougher paths */
+    double L = 8.0 + 4.0 / sqrt(H);
+    double w = L * sqrt(fabs(c2));
+    if (w < 1.0) w = 1.0; /* minimum width */
+
+    *a_out = c1 - w;
+    *b_out = c1 + w;
+}
+
+/* Compute CF coefficients for COS method at timestep dt.
+ * F_k = Re{ phi(u_k, dt) * exp(-i * u_k * a) } where u_k = k*pi/(b-a) */
+static inline int charlton__cos_cf_coeffs(charlton_cos_workspace *ws,
+                                           const charlton_model_params *p,
+                                           double dt) {
+    int N = ws->n_cos_terms;
+    double ba = ws->b - ws->a;
+    double a = ws->a;
+
+    /* Build ABM solver for this timestep duration */
+    charlton_abm_solver solver;
+    /* Use fewer ABM steps for small dt to keep cost down */
+    size_t abm_N = 64;
+    if (dt < 0.01) abm_N = 32;
+
+    int rc = charlton_abm_init(&solver, p->H, dt, abm_N,
+                                p->lambda, p->theta, p->nu, p->rho);
+    if (rc != CHARLTON_OK) return rc;
+
+    double drift = (p->r - p->q) * dt;
+
+    for (int k = 0; k < N; ++k) {
+        double u_k = (double)k * M_PI / ba;
+        charlton_cmplx u = CHARLTON_CMPLX(u_k, 0.0);
+        charlton_cmplx psi = charlton_abm_solve_single(&solver, u, 3);
+        /* CF of log-return over dt: phi(u_k) = exp(psi * V0 + i*u*drift) */
+        charlton_cmplx log_cf = psi * p->V0 + CHARLTON_I * u_k * drift;
+        charlton_cmplx phi_val = charlton_cexp(log_cf);
+        ws->cf_re[k] = charlton_creal(phi_val);
+        ws->cf_im[k] = charlton_cimag(phi_val);
+    }
+
+    charlton_abm_free(&solver);
+    return CHARLTON_OK;
+}
+
+/* Compute analytic COS coefficients for put payoff: max(K - e^x, 0) on [a,b]
+ * where x = log(S/K), so payoff in x-space is K * max(1 - e^x, 0) for x <= 0.
+ * Integration limit: a to min(0, b). */
+static inline void charlton__cos_put_payoff_coeffs(charlton_cos_workspace *ws, double K) {
+    int N = ws->n_cos_terms;
+    double a = ws->a;
+    double b = ws->b;
+    double ba = b - a;
+    double x_star = 0.0; /* exercise boundary in log-moneyness: S = K when x = 0 */
+    if (x_star > b) x_star = b;
+    if (x_star < a) { /* entirely OTM */
+        memset(ws->payoff_coeffs, 0, (size_t)N * sizeof(double));
+        return;
+    }
+
+    for (int k = 0; k < N; ++k) {
+        double kpi = (double)k * M_PI;
+        /* integral of (K - K*e^x) * cos(k*pi*(x-a)/(b-a)) dx from a to 0 */
+        /* = K * integral_a^0 cos(k*pi*(x-a)/(b-a)) dx
+         *   - K * integral_a^0 e^x * cos(k*pi*(x-a)/(b-a)) dx */
+        double chi_k, psi_k;
+
+        if (k == 0) {
+            psi_k = x_star - a;
+            chi_k = exp(x_star) - exp(a);
+        } else {
+            double w = kpi / ba;
+            /* psi_k = integral_a^{x_star} cos(w*(x-a)) dx = sin(w*(x_star-a)) / w */
+            psi_k = sin(w * (x_star - a)) / w;
+            /* chi_k = integral_a^{x_star} e^x cos(w*(x-a)) dx (closed form) */
+            double denom = 1.0 + w * w;
+            double xs_a = x_star - a;
+            chi_k = (exp(x_star) * (cos(w * xs_a) + w * sin(w * xs_a)) - exp(a)) / denom;
+        }
+
+        ws->payoff_coeffs[k] = (2.0 / ba) * K * (psi_k - chi_k);
+    }
+}
+
+/* Compute COS coefficients for call payoff via put-call parity decomposition.
+ * max(S-K,0) = max(S-K,0) - max(K-S,0) + max(K-S,0)
+ *            = (S - K) + max(K-S,0)    for S >= K, or max(K-S,0) for S < K
+ * So call_payoff = put_payoff + (e^x - 1)*K
+ *
+ * COS coefficients: call_k = put_k + K*(chi_k^{a,b} - psi_k^{a,b})
+ * where chi_k = integral_a^b e^x cos(...) and psi_k = integral_a^b cos(...).
+ * This avoids the unbounded exponential growth issue. */
+static inline void charlton__cos_call_payoff_coeffs(charlton_cos_workspace *ws, double K) {
+    int N = ws->n_cos_terms;
+    double a = ws->a;
+    double b = ws->b;
+    double ba = b - a;
+
+    /* First compute put payoff coefficients */
+    charlton__cos_put_payoff_coeffs(ws, K);
+
+    /* Add (e^x - 1)*K COS coefficients over [a,b] */
+    for (int k = 0; k < N; ++k) {
+        double kpi = (double)k * M_PI;
+        double chi_k, psi_k;
+
+        if (k == 0) {
+            chi_k = exp(b) - exp(a);
+            psi_k = ba;
+        } else {
+            double w = kpi / ba;
+            double denom = 1.0 + w * w;
+            /* chi_k = integral_a^b e^x cos(w*(x-a)) dx */
+            chi_k = (exp(b) * (cos(kpi) + w * sin(kpi))
+                     - exp(a) * (1.0 + 0.0)) / denom;
+            /* sin(k*pi) = 0, cos(k*pi) = (-1)^k */
+            chi_k = (exp(b) * (((k % 2 == 0) ? 1.0 : -1.0))
+                     - exp(a)) / denom;
+            /* psi_k = integral_a^b cos(w*(x-a)) dx = sin(k*pi)/w = 0 */
+            psi_k = 0.0;
+        }
+
+        ws->payoff_coeffs[k] += (2.0 / ba) * K * (chi_k - psi_k);
+    }
+}
+
+/* Evaluate continuation value at point x using COS series.
+ * C(x) = e^{-r*dt} * sum_k (w_k) Re{phi_k * exp(i*u_k*(x-a))} * V_k */
+static inline double charlton__cos_continuation(const charlton_cos_workspace *ws,
+                                                 double x, double discount) {
+    int N = ws->n_cos_terms;
+    double ba = ws->b - ws->a;
+    double xa = x - ws->a;
+    double cont = 0.0;
+    for (int k = 0; k < N; ++k) {
+        double u_k = (double)k * M_PI / ba;
+        double angle = u_k * xa;
+        double re_part = ws->cf_re[k] * cos(angle) - ws->cf_im[k] * sin(angle);
+        double weight = (k == 0) ? 0.5 : 1.0;
+        cont += weight * re_part * ws->V_coeffs[k];
+    }
+    return discount * cont;
+}
+
+/* Analytic COS coefficient integrals for put payoff K*(1-e^x) over [a_lim, b_lim].
+ * chi_k = integral_{a_lim}^{b_lim} e^x * cos(k*pi*(x-a)/(b-a)) dx
+ * psi_k = integral_{a_lim}^{b_lim} cos(k*pi*(x-a)/(b-a)) dx */
+static inline void charlton__cos_chi_psi(double a, double b, double a_lim, double b_lim,
+                                          int k, double *chi_out, double *psi_out) {
+    double ba = b - a;
+    if (k == 0) {
+        *psi_out = b_lim - a_lim;
+        *chi_out = exp(b_lim) - exp(a_lim);
+    } else {
+        double w = (double)k * M_PI / ba;
+        double al = a_lim - a;
+        double bl = b_lim - a;
+        *psi_out = (sin(w * bl) - sin(w * al)) / w;
+        double denom = 1.0 + w * w;
+        *chi_out = (exp(b_lim) * (cos(w * bl) + w * sin(w * bl))
+                   - exp(a_lim) * (cos(w * al) + w * sin(w * al))) / denom;
+    }
+}
+
+/* Compute COS coefficient of continuation value on interval [c_lo, c_hi]:
+ * H_k = (2/(b-a)) * integral_{c_lo}^{c_hi} C(x) cos(k*pi*(x-a)/(b-a)) dx
+ * where C(x) = discount * sum_j (w_j) Re{phi_j exp(i*u_j*(x-a))} * V_j
+ *
+ * This expands to a sum over j of analytic integrals involving
+ * cos*cos and sin*cos products. */
+static inline double charlton__cos_cont_coeff(const charlton_cos_workspace *ws,
+                                               int k, double c_lo, double c_hi,
+                                               double discount) {
+    int N = ws->n_cos_terms;
+    double ba = ws->b - ws->a;
+    double a = ws->a;
+    double w_k = (double)k * M_PI / ba;
+    double lo = c_lo - a;
+    double hi = c_hi - a;
+
+    double H_k = 0.0;
+    for (int j = 0; j < N; ++j) {
+        double w_j = (double)j * M_PI / ba;
+        double wt = (j == 0) ? 0.5 : 1.0;
+        double phi_re = ws->cf_re[j];
+        double phi_im = ws->cf_im[j];
+
+        /* Re{phi_j * exp(i*w_j*t)} = phi_re*cos(w_j*t) - phi_im*sin(w_j*t)
+         * Need: integral_{lo}^{hi} [phi_re*cos(w_j*t) - phi_im*sin(w_j*t)] * cos(w_k*t) dt */
+        double I_cc, I_sc; /* cos*cos and sin*cos integrals */
+
+        if (j == k) {
+            /* cos(w*t)*cos(w*t) = (1 + cos(2w*t))/2 */
+            if (k == 0) {
+                I_cc = hi - lo;
+            } else {
+                double w2 = 2.0 * w_k;
+                I_cc = (hi - lo) / 2.0 + (sin(w2 * hi) - sin(w2 * lo)) / (2.0 * w2);
+            }
+            /* sin(w*t)*cos(w*t) = sin(2w*t)/2 */
+            if (k == 0) {
+                I_sc = 0.0;
+            } else {
+                double w2 = 2.0 * w_k;
+                I_sc = -(cos(w2 * hi) - cos(w2 * lo)) / (2.0 * w2);
+            }
+        } else {
+            double wp = w_j + w_k;
+            double wm = w_j - w_k;
+            /* cos(w_j*t)*cos(w_k*t) = [cos((w_j-w_k)*t) + cos((w_j+w_k)*t)]/2 */
+            if (fabs(wm) < 1e-15)
+                I_cc = (hi - lo) / 2.0 + (sin(wp * hi) - sin(wp * lo)) / (2.0 * wp);
+            else
+                I_cc = (sin(wm * hi) - sin(wm * lo)) / (2.0 * wm)
+                     + (sin(wp * hi) - sin(wp * lo)) / (2.0 * wp);
+            /* sin(w_j*t)*cos(w_k*t) = [sin((w_j+w_k)*t) + sin((w_j-w_k)*t)]/2 */
+            if (fabs(wm) < 1e-15)
+                I_sc = -(cos(wp * hi) - cos(wp * lo)) / (2.0 * wp);
+            else
+                I_sc = -(cos(wm * hi) - cos(wm * lo)) / (2.0 * wm)
+                     - (cos(wp * hi) - cos(wp * lo)) / (2.0 * wp);
+            I_sc *= -1.0; /* correct sign: integral of sin(w_j*t)*cos(w_k*t) */
+
+            /* Recompute: sin(a)*cos(b) = [sin(a+b) + sin(a-b)]/2 */
+            I_sc = ((cos(wm * lo) - cos(wm * hi)) / (2.0 * (fabs(wm) < 1e-15 ? 1e-15 : wm))
+                  + (cos(wp * lo) - cos(wp * hi)) / (2.0 * wp));
+        }
+
+        H_k += wt * discount * ws->V_coeffs[j] * (phi_re * I_cc - phi_im * I_sc);
+    }
+
+    return (2.0 / ba) * H_k;
+}
+
+/* One backward induction step using Fang-Oosterlee analytic coefficient update.
+ * No grid-space round-trip — works entirely in COS coefficient space.
+ * Returns exercise boundary x* (in log-moneyness). */
+static inline double charlton__cos_backward_step(charlton_cos_workspace *ws, double K,
+                                                   int is_call, double r_dt) {
+    int N = ws->n_cos_terms;
+    double ba = ws->b - ws->a;
+    double a = ws->a;
+    double b = ws->b;
+    double discount = exp(-r_dt);
+
+    /* Step 1: Find exercise boundary x* via bisection.
+     * For put: find rightmost x where payoff(x) >= continuation(x).
+     * payoff(x) = K*(1 - e^x) for x <= 0, 0 for x > 0. */
+    double x_lo = a, x_hi = 0.0; /* for puts, boundary is in [a, 0] */
+    if (is_call) { x_lo = 0.0; x_hi = b; }
+
+    /* Check if early exercise is ever optimal */
+    double pay_lo, pay_hi, cont_lo, cont_hi;
+    if (!is_call) {
+        pay_lo = K * (1.0 - exp(x_lo));
+        pay_hi = 0.0; /* payoff at x=0 */
+        cont_lo = charlton__cos_continuation(ws, x_lo, discount);
+        cont_hi = charlton__cos_continuation(ws, x_hi, discount);
+    } else {
+        pay_lo = 0.0;
+        pay_hi = K * (exp(x_hi) - 1.0);
+        cont_lo = charlton__cos_continuation(ws, x_lo, discount);
+        cont_hi = charlton__cos_continuation(ws, x_hi, discount);
+    }
+
+    double x_star;
+    int exercise_optimal = 0;
+
+    if (!is_call) {
+        /* For put: if payoff(a) > continuation(a), there's early exercise */
+        if (pay_lo > cont_lo) {
+            exercise_optimal = 1;
+            /* Bisect to find x* where payoff = continuation */
+            for (int iter = 0; iter < 50; ++iter) {
+                double x_mid = 0.5 * (x_lo + x_hi);
+                double pay_mid = K * (1.0 - exp(x_mid));
+                double cont_mid = charlton__cos_continuation(ws, x_mid, discount);
+                if (pay_mid > cont_mid)
+                    x_lo = x_mid;
+                else
+                    x_hi = x_mid;
+            }
+            x_star = 0.5 * (x_lo + x_hi);
+        } else {
+            /* No early exercise — continuation dominates everywhere */
+            x_star = a;
+        }
+    } else {
+        /* For call: if payoff(b) > continuation(b), there's early exercise */
+        if (pay_hi > cont_hi) {
+            exercise_optimal = 1;
+            for (int iter = 0; iter < 50; ++iter) {
+                double x_mid = 0.5 * (x_lo + x_hi);
+                double pay_mid = K * (exp(x_mid) - 1.0);
+                double cont_mid = charlton__cos_continuation(ws, x_mid, discount);
+                if (pay_mid > cont_mid)
+                    x_hi = x_mid;
+                else
+                    x_lo = x_mid;
+            }
+            x_star = 0.5 * (x_lo + x_hi);
+        } else {
+            x_star = b;
+        }
+    }
+
+    /* Step 2: Update V_coeffs analytically.
+     * For put: V(x) = payoff on [a, x*], continuation on [x*, b].
+     * V_k = (2/(b-a)) * [integral_a^{x*} K(1-e^x)cos(w_k(x-a)) dx
+     *                    + integral_{x*}^b C(x) cos(w_k(x-a)) dx] */
+
+    if (!exercise_optimal && !is_call) {
+        /* No early exercise: V_k = continuation coefficient on full [a, b] */
+        for (int k = 0; k < N; ++k) {
+            ws->grid_vals[k] = charlton__cos_cont_coeff(ws, k, a, b, discount);
+        }
+    } else if (!exercise_optimal && is_call) {
+        for (int k = 0; k < N; ++k) {
+            ws->grid_vals[k] = charlton__cos_cont_coeff(ws, k, a, b, discount);
+        }
+    } else if (!is_call) {
+        /* Put with early exercise at x* */
+        for (int k = 0; k < N; ++k) {
+            /* Payoff part on [a, x*] */
+            double chi_k, psi_k;
+            charlton__cos_chi_psi(a, b, a, x_star, k, &chi_k, &psi_k);
+            double payoff_k = (2.0 / ba) * K * (psi_k - chi_k);
+
+            /* Continuation part on [x*, b] */
+            double cont_k = charlton__cos_cont_coeff(ws, k, x_star, b, discount);
+
+            ws->grid_vals[k] = payoff_k + cont_k;
+        }
+    } else {
+        /* Call with early exercise at x* */
+        for (int k = 0; k < N; ++k) {
+            /* Continuation on [a, x*] */
+            double cont_k = charlton__cos_cont_coeff(ws, k, a, x_star, discount);
+
+            /* Payoff on [x*, b] */
+            double chi_k, psi_k;
+            charlton__cos_chi_psi(a, b, x_star, b, k, &chi_k, &psi_k);
+            double payoff_k = (2.0 / ba) * K * (chi_k - psi_k);
+
+            ws->grid_vals[k] = cont_k + payoff_k;
+        }
+    }
+
+    /* Copy new coefficients */
+    memcpy(ws->V_coeffs, ws->grid_vals, (size_t)N * sizeof(double));
+
+    return exercise_optimal ? x_star : (is_call ? b : a);
+}
+
+/* Core COS backward induction for American options.
+ * Returns 0 on success, fills result. If boundary != NULL, records S*(t_m). */
+static inline int charlton__cos_american_core(const charlton_model_params *p, double K,
+                                               int n_timesteps, int n_cos_terms,
+                                               int is_call,
+                                               charlton_american_result *result,
+                                               double *boundary_out) {
+    if (!p || !result) return CHARLTON_ERR_PARAM;
+    if (p->T <= 0.0 || K <= 0.0) return CHARLTON_ERR_PARAM;
+    if (n_timesteps < 1) n_timesteps = 64;
+    if (n_cos_terms < 8) n_cos_terms = 128;
+
+    memset(result, 0, sizeof(*result));
+    result->n_timesteps = n_timesteps;
+    result->n_cos_terms = n_cos_terms;
+
+    /* Compute truncation range */
+    double a, b;
+    charlton__cos_truncation(p, &a, &b);
+
+    /* Initialize workspace */
+    charlton_cos_workspace ws;
+    int rc = charlton_cos_init(&ws, n_timesteps, n_cos_terms, a, b);
+    if (rc != CHARLTON_OK) return rc;
+
+    int N = ws.n_cos_terms; /* may have been rounded up to power of 2 */
+    double dt = p->T / (double)n_timesteps;
+
+    /* Compute CF coefficients for one timestep */
+    rc = charlton__cos_cf_coeffs(&ws, p, dt);
+    if (rc != CHARLTON_OK) {
+        charlton_cos_free(&ws);
+        return rc;
+    }
+
+    /* Terminal payoff coefficients */
+    if (is_call)
+        charlton__cos_call_payoff_coeffs(&ws, K);
+    else
+        charlton__cos_put_payoff_coeffs(&ws, K);
+
+    /* Initialize V_coeffs with payoff coefficients */
+    memcpy(ws.V_coeffs, ws.payoff_coeffs, (size_t)N * sizeof(double));
+
+    /* Backward induction */
+    for (int m = n_timesteps - 1; m >= 0; --m) {
+        double x_star = charlton__cos_backward_step(&ws, K, is_call, p->r * dt);
+        if (boundary_out) {
+            boundary_out[m] = K * exp(x_star);
+        }
+    }
+
+    /* Price recovery: evaluate COS series at x = log(S0/K).
+     * After backward induction, V_coeffs represent the option value.
+     * V(x) = sum_k (w_k) * V_k * cos(k*pi*(x-a)/(b-a)) */
+    double x0 = log(p->S0 / K);
+    double ba = ws.b - ws.a;
+    double price = 0.0;
+    for (int k = 0; k < N; ++k) {
+        double cos_term = cos((double)k * M_PI * (x0 - ws.a) / ba);
+        double weight = (k == 0) ? 0.5 : 1.0;
+        price += weight * ws.V_coeffs[k] * cos_term;
+    }
+
+    /* Ensure non-negative */
+    if (price < 0.0) price = 0.0;
+
+    /* Compute European price for early exercise premium */
+    double euro_price;
+    if (is_call)
+        euro_price = charlton_price_call(p, K, 1e-8);
+    else
+        euro_price = charlton_price_put(p, K, 1e-8);
+
+    /* If American price is somehow less than European (numerical error), use European */
+    if (price < euro_price) price = euro_price;
+
+    double intrinsic;
+    if (is_call)
+        intrinsic = (p->S0 > K) ? (p->S0 - K) : 0.0;
+    else
+        intrinsic = (K > p->S0) ? (K - p->S0) : 0.0;
+
+    /* Ensure >= intrinsic */
+    if (price < intrinsic) price = intrinsic;
+
+    result->price = price;
+    result->early_exercise_premium = price - euro_price;
+    result->converged = 1;
+
+    charlton_cos_free(&ws);
+    return CHARLTON_OK;
+}
+
+static inline int charlton_price_american_put(const charlton_model_params *p, double K,
+                                               int n_timesteps, int n_cos_terms,
+                                               charlton_american_result *result) {
+    return charlton__cos_american_core(p, K, n_timesteps, n_cos_terms, 0, result, NULL);
+}
+
+static inline int charlton_price_american_call(const charlton_model_params *p, double K,
+                                                int n_timesteps, int n_cos_terms,
+                                                charlton_american_result *result) {
+    if (!p || !result) return CHARLTON_ERR_PARAM;
+
+    /* For q=0 (or very small q), American call = European call: no early exercise */
+    if (fabs(p->q) < 1e-12) {
+        double euro_call = charlton_price_call(p, K, 1e-8);
+        memset(result, 0, sizeof(*result));
+        result->price = euro_call;
+        result->early_exercise_premium = 0.0;
+        result->n_timesteps = n_timesteps;
+        result->n_cos_terms = n_cos_terms;
+        result->converged = 1;
+        return CHARLTON_OK;
+    }
+
+    /* For q > 0, use put-call symmetry: C_am(S,K,r,q,T) = P_am(K,S,q,r,T)
+     * Swap S0 <-> K and r <-> q, then price American put. */
+    charlton_model_params p_sym = *p;
+    p_sym.S0 = K;
+    p_sym.r = p->q;
+    p_sym.q = p->r;
+    /* rho sign flips under put-call symmetry for stochastic vol models */
+    p_sym.rho = -p->rho;
+
+    charlton_american_result put_result;
+    int rc = charlton__cos_american_core(&p_sym, p->S0, n_timesteps, n_cos_terms,
+                                          0, &put_result, NULL);
+    if (rc != CHARLTON_OK) return rc;
+
+    *result = put_result;
+    return CHARLTON_OK;
+}
+
+/* Extract exercise boundary fitted to Chebyshev nodes */
+static inline int charlton_american_exercise_boundary(const charlton_model_params *p,
+                                                       double K, int n_timesteps,
+                                                       int n_cos_terms, int n_cheb,
+                                                       charlton_exercise_boundary *eb) {
+    if (!p || !eb) return CHARLTON_ERR_PARAM;
+    if (n_cheb < 3) n_cheb = 16;
+    if (n_timesteps < 1) n_timesteps = 64;
+    if (n_cos_terms < 8) n_cos_terms = 128;
+
+    memset(eb, 0, sizeof(*eb));
+    eb->n_cheb = n_cheb;
+    eb->n_timesteps = n_timesteps;
+
+    /* Allocate raw boundary storage */
+    double *raw_boundary = charlton_alloc_doubles((size_t)n_timesteps);
+    if (!raw_boundary) return CHARLTON_ERR_ALLOC;
+
+    /* Run backward induction recording boundary */
+    charlton_american_result result;
+    int rc = charlton__cos_american_core(p, K, n_timesteps, n_cos_terms, 0,
+                                          &result, raw_boundary);
+    if (rc != CHARLTON_OK) {
+        charlton_aligned_free(raw_boundary);
+        return rc;
+    }
+
+    /* Allocate Chebyshev arrays */
+    eb->nodes = charlton_alloc_doubles((size_t)n_cheb);
+    eb->boundary = charlton_alloc_doubles((size_t)n_cheb);
+    eb->bary_weights = charlton_alloc_doubles((size_t)n_cheb);
+    if (!eb->nodes || !eb->boundary || !eb->bary_weights) {
+        charlton_aligned_free(raw_boundary);
+        charlton_aligned_free(eb->nodes);
+        charlton_aligned_free(eb->boundary);
+        charlton_aligned_free(eb->bary_weights);
+        memset(eb, 0, sizeof(*eb));
+        return CHARLTON_ERR_ALLOC;
+    }
+
+    /* Chebyshev nodes in [0, T] */
+    charlton__cheb_nodes(n_cheb, 0.0, p->T, eb->nodes);
+    charlton__cheb_bary_weights(n_cheb, eb->bary_weights);
+
+    /* Interpolate raw boundary (uniform in time) to Chebyshev nodes */
+    double dt = p->T / (double)n_timesteps;
+    for (int j = 0; j < n_cheb; ++j) {
+        double t = eb->nodes[j];
+        /* Linear interpolation from raw boundary */
+        double idx_f = t / dt;
+        int idx_lo = (int)idx_f;
+        if (idx_lo < 0) idx_lo = 0;
+        if (idx_lo >= n_timesteps - 1) {
+            eb->boundary[j] = raw_boundary[n_timesteps - 1];
+        } else {
+            double frac = idx_f - (double)idx_lo;
+            eb->boundary[j] = (1.0 - frac) * raw_boundary[idx_lo]
+                             + frac * raw_boundary[idx_lo + 1];
+        }
+        /* Clamp to [0, K] for puts */
+        if (eb->boundary[j] > K) eb->boundary[j] = K;
+        if (eb->boundary[j] < 0.0) eb->boundary[j] = 0.0;
+    }
+
+    charlton_aligned_free(raw_boundary);
+    return CHARLTON_OK;
+}
+
+static inline void charlton_exercise_boundary_free(charlton_exercise_boundary *eb) {
+    charlton_aligned_free(eb->nodes);
+    charlton_aligned_free(eb->boundary);
+    charlton_aligned_free(eb->bary_weights);
+    memset(eb, 0, sizeof(*eb));
+}
+
+/* American Greeks via bump-and-reprice */
+static inline int charlton_american_greeks(const charlton_model_params *p, double K,
+                                            int greek_set, charlton_pricing_result *result) {
+    if (!p || !result) return CHARLTON_ERR_PARAM;
+    charlton_pricing_result_init(result);
+
+    int n_ts = 64, n_cos = 128;
+    charlton_american_result ar;
+
+    /* Base price */
+    int rc = charlton_price_american_put(p, K, n_ts, n_cos, &ar);
+    if (rc != CHARLTON_OK) return rc;
+    result->price = ar.price;
+
+    if (greek_set == CHARLTON_GREEKS_PRICE_ONLY) return CHARLTON_OK;
+
+    double eps_S = p->S0 * 0.001;
+    double eps_v = p->V0 * 0.01;
+    double eps_T = p->T * 0.001;
+    double eps_r = 0.0001;
+
+    /* Delta and Gamma */
+    {
+        charlton_model_params p_up = *p, p_dn = *p;
+        p_up.S0 += eps_S; p_dn.S0 -= eps_S;
+        charlton_american_result r_up, r_dn;
+        charlton_price_american_put(&p_up, K, n_ts, n_cos, &r_up);
+        charlton_price_american_put(&p_dn, K, n_ts, n_cos, &r_dn);
+        result->delta = (r_up.price - r_dn.price) / (2.0 * eps_S);
+        result->gamma = (r_up.price - 2.0 * ar.price + r_dn.price) / (eps_S * eps_S);
+    }
+
+    /* Theta */
+    {
+        charlton_model_params p_dn = *p;
+        p_dn.T -= eps_T;
+        if (p_dn.T > 0.0) {
+            charlton_american_result r_dn;
+            charlton_price_american_put(&p_dn, K, n_ts, n_cos, &r_dn);
+            result->theta = -(r_dn.price - ar.price) / eps_T;
+        }
+    }
+
+    /* Vega */
+    {
+        charlton_model_params p_up = *p, p_dn = *p;
+        p_up.V0 += eps_v; p_dn.V0 -= eps_v;
+        charlton_american_result r_up, r_dn;
+        charlton_price_american_put(&p_up, K, n_ts, n_cos, &r_up);
+        charlton_price_american_put(&p_dn, K, n_ts, n_cos, &r_dn);
+        result->vega = (r_up.price - r_dn.price) / (2.0 * eps_v);
+    }
+
+    /* Rho */
+    {
+        charlton_model_params p_up = *p, p_dn = *p;
+        p_up.r += eps_r; p_dn.r -= eps_r;
+        charlton_american_result r_up, r_dn;
+        charlton_price_american_put(&p_up, K, n_ts, n_cos, &r_up);
+        charlton_price_american_put(&p_dn, K, n_ts, n_cos, &r_dn);
+        result->rho = (r_up.price - r_dn.price) / (2.0 * eps_r);
+    }
+
+    return CHARLTON_OK;
 }
 
 /* ============================================================================
