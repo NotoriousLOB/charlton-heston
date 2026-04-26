@@ -12,13 +12,13 @@ A high-performance C++ library for pricing and calibration in the **Rough Heston
 
 ## Features
 
-- 🚀 **SINH-Acceleration**: Conformal deformation for ultra-fast Fourier inversion (20-60 quadrature points vs 200-400 for standard methods)
-- 🎯 **BL-Modified Adams**: Corrected fractional Riccati solver for short-maturity accuracy
-- ✅ **Conformal Bootstrap**: Rigorous a posteriori error control eliminates "ghost calibration"
-- 📊 **Comprehensive Greeks**: Machine-precision sensitivities via Complex Step Differentiation
-- ⚡ **SIMD Optimized**: AVX2/AVX512/NEON vectorization
-- 🧵 **Parallel**: OpenMP batch processing for multiple strikes/frequencies
-- 🔧 **Modern C++17**: Header-only template library with CMake build system
+- **SINH-Acceleration**: Conformal deformation for ultra-fast Fourier inversion (20-60 quadrature points vs 200-400 for standard methods)
+- **BL-Modified Adams**: Corrected fractional Riccati solver for short-maturity accuracy
+- **Conformal Bootstrap**: Rigorous a posteriori error control eliminates "ghost calibration"
+- **Comprehensive Greeks**: Machine-precision sensitivities via Complex Step Differentiation
+- **SIMD Optimized**: AVX2/AVX512/NEON vectorization
+- **Parallel**: OpenMP batch processing for multiple strikes/frequencies
+- **Modern C++17**: Header-only template library with CMake build system
 
 ## Quick Start
 
@@ -113,8 +113,6 @@ Compared to Markovian approximations (BL2): **100-1000× faster** with **superio
 
 ## Documentation
 
-- [Analysis & Design](docs/ANALYSIS.md) - Comprehensive technical analysis
-- [Paper Abstract](docs/PAPER_ABSTRACT.md) - Academic paper proposal
 - API Reference - Coming soon
 
 ## Testing
@@ -168,14 +166,7 @@ Error is controlled by comparing prices from multiple contour deformations. If t
 
 MIT License - see [LICENSE](LICENSE) file for details.
 
-## Contributing
-
-Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
 ## Acknowledgments
 
 This implementation is based on the pioneering work of Svetlana Boyarchenko, Marco De Innocentis, and Sergei Levendorski˘i on SINH-acceleration and the BL-modified fractional Adams method.
 
----
-
-*"You can have my rough volatility model when you pry it from my COLD DEAD HAND!"*

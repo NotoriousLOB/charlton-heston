@@ -9,6 +9,8 @@
 #ifndef CHARLTON_HPP
 #define CHARLTON_HPP
 
+#include "charlton.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <complex>
@@ -213,13 +215,15 @@ protected:
     Scalar gamma_, theta_, nu_, rho_;
     std::vector<Scalar, AlignedAllocator<Scalar>> a_weights_;
     Scalar gamma_alpha1_, gamma_alpha2_;
+    std::unique_ptr<charlton_abm_solver, void(*)(charlton_abm_solver*)> c_solver_;
 
 public:
     FractionalABMSolver(Scalar H, Scalar T, size_t N,
                         Scalar gamma, Scalar theta, Scalar nu, Scalar rho,
                         bool use_fft = false)
         : alpha_(H + Scalar(0.5)), h_(T / static_cast<Scalar>(N)), N_(N),
-          gamma_(gamma), theta_(theta), nu_(nu), rho_(rho)
+          gamma_(gamma), theta_(theta), nu_(nu), rho_(rho),
+          c_solver_(nullptr, nullptr)
     {
         if constexpr (!is_complex_v<Scalar>) {
             if (H <= 0.0 || H >= 0.5) throw std::invalid_argument("H must be in (0, 0.5)");
@@ -229,6 +233,22 @@ public:
         gamma_alpha1_ = Scalar(1.0) / std::tgamma(alpha_ + Scalar(1.0));
         gamma_alpha2_ = Scalar(1.0) / std::tgamma(alpha_ + Scalar(2.0));
         compute_adams_weights();
+
+        /* Delegate to C solver when Scalar == double for DCT fast path */
+        if constexpr (std::is_same_v<Scalar, double>) {
+            auto* s = new charlton_abm_solver;
+            int rc = charlton_abm_init(s, H, T, N,
+                                       static_cast<double>(gamma),
+                                       static_cast<double>(theta),
+                                       static_cast<double>(nu),
+                                       static_cast<double>(rho));
+            if (rc == CHARLTON_OK) {
+                c_solver_.reset(s);
+                c_solver_.get_deleter() = &charlton_abm_free;
+            } else {
+                delete s;
+            }
+        }
     }
 
     void solve_batch(const std::vector<Cmplx>& u_batch, std::vector<Cmplx>& result) const {
@@ -240,10 +260,33 @@ public:
     }
 
     Cmplx solve_single(const Cmplx& u, int n_picard = 3) const {
+        if (c_solver_) {
+            charlton_cmplx cu = CHARLTON_CMPLX(std::real(u), std::imag(u));
+            charlton_cmplx res = charlton_abm_solve_single(c_solver_.get(), cu, n_picard);
+            return Cmplx(charlton_creal(res), charlton_cimag(res));
+        }
+
         Scalar abs_u = std::abs(u);
         Scalar scale = Scalar(1.0) + abs_u;
-        std::vector<Cmplx> h1_tilde(N_ + 1);
-        std::vector<Cmplx> F_history(N_);
+
+        /* Stack allocation for small N, thread_local for large N (Item 3) */
+        static constexpr size_t STACK_N = 256;
+        Cmplx stack_h1[STACK_N + 1];
+        Cmplx stack_F[STACK_N];
+        Cmplx *h1_tilde, *F_history;
+
+        if (N_ <= STACK_N) {
+            h1_tilde = stack_h1;
+            F_history = stack_F;
+            std::memset(h1_tilde, 0, (N_ + 1) * sizeof(Cmplx));
+            std::memset(F_history, 0, N_ * sizeof(Cmplx));
+        } else {
+            static thread_local std::vector<Cmplx> tl_h1, tl_F;
+            tl_h1.assign(N_ + 1, Cmplx(0, 0));
+            tl_F.assign(N_, Cmplx(0, 0));
+            h1_tilde = tl_h1.data();
+            F_history = tl_F.data();
+        }
         h1_tilde[0] = Cmplx(0, 0);
         
         for(size_t n = 0; n < N_; ++n) {
@@ -307,7 +350,7 @@ protected:
     }
     
     Cmplx compute_characteristic_exponent(const Cmplx& u, 
-                                          const std::vector<Cmplx>& h1_tilde,
+                                          const Cmplx *h1_tilde,
                                           Scalar scale) const {
         Cmplx integral = Cmplx(0, 0);
         for(size_t k = 0; k <= N_; ++k) {
@@ -468,30 +511,12 @@ public:
             DEFAULT_LAMBDA_MINUS, DEFAULT_LAMBDA_PLUS,
             DEFAULT_GAMMA_MINUS, DEFAULT_GAMMA_PLUS, error_tol, false);
         Scalar raw_price = price_with_sinh(K, sinh_params);
-        
-        // Handle numerical failure (NaN/Inf) - only case for hard zero
+
+        /* Only guard against outright numerical failure (NaN/Inf) */
         if (!std::isfinite(raw_price)) {
             raw_price = 0.0;
         }
-        
-        // Deep ITM Put (K >> S): should be ~intrinsic value
-        Scalar intrinsic = std::max(Scalar(0.0), K * std::exp(-params_.r * params_.T) - params_.S0 * std::exp(-params_.q * params_.T));
-        if (K > 1.3 * params_.S0 && raw_price < 0.5 * intrinsic) {
-            // Numerical integration failed for deep ITM, use intrinsic approx
-            raw_price = intrinsic * 0.995;  // Slight discount for time value
-        }
-        
-        // Hard floor for numerical noise (asymmetric clamping)
-        const Scalar EPS = 1e-12;
-        if (raw_price < 0 && raw_price > -1e-8) {
-            raw_price = EPS;  // Tiny positive instead of exact zero
-        } else if (raw_price < -1e-8) {
-            // Legitimate negative (shouldn't happen), use intrinsic floor
-            raw_price = std::max(Scalar(0.0), K * std::exp(-params_.r * params_.T) - params_.S0 * std::exp(-params_.q * params_.T));
-        }
-        
-        // Ensure we never return exactly 0 (preserves monotonicity)
-        return std::max(EPS, raw_price);
+        return raw_price;
     }
     
     Scalar price_call(Scalar K, Scalar error_tol = 1e-10) const {
@@ -725,30 +750,30 @@ public:
     
     explicit RoughHestonGreeks(const ModelParams& params) : params_(params) {}
     
-    PricingResult<Scalar> compute(Scalar K, GreekSet gset = GreekSet::STANDARD, 
+    PricingResult<Scalar> compute(Scalar K, GreekSet gset = GreekSet::STANDARD,
                                    Scalar error_tol = 1e-8) {
         PricingResult<Scalar> result;
-        
+
         // Always compute price first
         result.price = compute_price(K);
-        
+
         if (gset == GreekSet::PRICE_ONLY) return result;
-        
+
         // Compute essential Greeks
         result.delta = compute_delta(K);
         result.gamma = compute_gamma(K);
         result.theta = compute_theta(K);
         result.vega = compute_vega(K);
         result.rho = compute_rho(K);
-        
+
         if (gset == GreekSet::ESSENTIAL) return result;
-        
+
         // Compute standard Greeks
         result.vanna = compute_vanna(K);
         result.volga = compute_volga(K);
-        
+
         if (gset == GreekSet::STANDARD) return result;
-        
+
         // Compute cornucopia Greeks
         result.zomma = compute_zomma(K);
         result.speed = compute_speed(K);
@@ -759,30 +784,7 @@ public:
         result.nu_sens = compute_nu_sens(K);
         result.lambda_sens = compute_lambda_sens(K);
         result.theta_sens = compute_theta_sens(K);
-        
-        // Clamp Greeks to valid bounds with tolerance
-        // Put delta: [-1, 0] with small tolerance for numerical noise
-        result.delta = std::max(Scalar(-1.0), std::min(Scalar(0.0), result.delta));
-        // Additional safety for numerical noise near boundaries
-        if (result.delta > -1e-6) result.delta = 0.0;      // OTM floor
-        if (result.delta < -1.0 + 1e-6) result.delta = -1.0;  // ITM ceiling
-        // Gamma >= 0, with tiny epsilon for extreme strikes
-        result.gamma = std::max(Scalar(0.0), result.gamma);
-        if (result.gamma < 1e-10) result.gamma = 1e-10;  // For test satisfaction
-        // Theta: clamp insane values
-        if (std::abs(result.theta) > 10.0) {
-            result.theta = -0.1;
-        }
-        
-        // For extreme strikes where FD is unreliable, use approximations
-        if (K > 1.5 * params_.S0) {        // Deep ITM
-            result.delta = -1.0;
-            result.gamma = 0.0;
-        } else if (K < 0.6 * params_.S0) { // Deep OTM
-            result.delta = 0.0;
-            result.gamma = 0.0;
-        }
-        
+
         return result;
     }
 
@@ -793,7 +795,7 @@ private:
     }
 
     Scalar compute_delta(Scalar K) {
-        // Use central differences instead of CSD for stability
+        // Central finite differences for robustness
         const Scalar bump = 1e-4;
         auto params_up = params_;
         auto params_down = params_;
@@ -806,18 +808,13 @@ private:
         Scalar price_up = pricer_up.price_put(K);
         Scalar price_down = pricer_down.price_put(K);
         
-        // Check for NaN/Inf
         if (!std::isfinite(price_up) || !std::isfinite(price_down)) {
             return Scalar(0.0);
         }
         
         Scalar delta = (price_up - price_down) / (2.0 * params_.S0 * bump);
-        
-        // Tight clamp to put delta bounds [-1, 0]
+        /* Enforce theoretical bounds [-1, 0] for put delta */
         delta = std::max(Scalar(-1.0), std::min(Scalar(0.0), delta));
-        // Additional safety for numerical noise near boundaries
-        if (delta > -1e-6) delta = 0.0;      // OTM floor
-        if (delta < -1.0 + 1e-6) delta = -1.0;  // ITM ceiling
         return delta;
     }
 

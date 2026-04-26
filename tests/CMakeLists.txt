@@ -7,6 +7,7 @@ add_executable(charlton_tests
     test_greeks.cpp
     test_calibration.cpp
     test_american.cpp
+    test_real_data.cpp
 )
 
 target_link_libraries(charlton_tests PRIVATE

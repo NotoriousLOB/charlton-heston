@@ -83,3 +83,6 @@ callgrind.*
 *.gch
 *.pch
 compile_commands.json
+
+# Data
+data

@@ -163,9 +163,14 @@ typedef struct {
     double *a_weights;     /* Triangular packed Adams weights */
     double *t_alpha_cache; /* Precomputed pow(t[n], alpha) for n=0..N */
     double *k_alpha1_cache;/* Precomputed pow(k, alpha+1) for k=0..N+2 */
-    double *dct_evals;     /* Gupta-Joshi DCT eigenvalues (NULL = O(N^2) fallback) */
-    double *dct_aux_buf;   /* Scratch buffer for DCT transforms */
-    notorious_fft_aux *fft_aux; /* Notorious-FFT aux for DCT-II/III */
+    /* FFT fast-path for lower-triangular Toeplitz convolution */
+    double *boundary_weights;     /* a_weights[n*(n+1)/2] for n=0..N-1 */
+    notorious_fft_cmpl *fft_kernel; /* Precomputed FFT of padded kernel, length fft_n */
+    notorious_fft_cmpl *fft_F_buf;  /* FFT of F_history (scratch), length fft_n */
+    notorious_fft_cmpl *fft_g_buf;  /* Inverse FFT result (scratch), length fft_n */
+    notorious_fft_aux *fft_aux;     /* Notorious-FFT aux for DFT */
+    size_t  fft_n;                  /* padded size (next pow2 >= 2N) */
+    int     force_on2;              /* for benchmark: force O(N^2) fallback */
 } charlton_abm_solver;
 
 typedef struct {
@@ -219,6 +224,14 @@ typedef struct {
     double *payoff_coeffs;/* N allocated doubles for payoff COS coeffs */
     double *grid_vals;    /* N allocated doubles for grid-space values */
     double a, b;          /* truncation range [a,b] in log-moneyness */
+    /* DCT-accelerated grid-space buffers (American option pricing) */
+    notorious_fft_aux *dct2_aux;   /* N-point DCT-II aux */
+    notorious_fft_aux *dct3_aux;   /* N-point DCT-III aux */
+    notorious_fft_aux *idft_aux;   /* 2N-point inverse DFT aux */
+    notorious_fft_cmpl *fft_buf;   /* 2N complex buffer for IFFT */
+    double *grid_x;        /* N grid points x_m = a + (m+0.5)*(b-a)/N */
+    double *grid_C;        /* continuation values on grid */
+    int use_dct;           /* 1 if DCT plans allocated successfully */
 } charlton_cos_workspace;
 
 typedef struct {
@@ -399,44 +412,65 @@ static inline void charlton__compute_adams_weights(charlton_abm_solver *s) {
     }
 }
 
-static inline void charlton__compute_dct_eigenvalues(charlton_abm_solver *s) {
-    /* Build Toeplitz kernel column from Adams weights, DCT-II it */
+/* Helper macros for interleaved complex access (works in both C and C++) */
+#define CHARLTON_FFT_RE(ptr, i) (((double*)(ptr))[2*(i)])
+#define CHARLTON_FFT_IM(ptr, i) (((double*)(ptr))[2*(i)+1])
+
+static inline void charlton__compute_fft_kernel(charlton_abm_solver *s) {
+    /* Precompute FFT of padded Toeplitz kernel for fast convolution */
     size_t N = s->N;
-    if (N < 8) { s->dct_evals = NULL; return; }
+    if (N < 8) { s->fft_kernel = NULL; return; }
 
-    /* Need power-of-2 for efficient DCT */
-    size_t dct_n = 1;
-    while (dct_n < N) dct_n <<= 1;
+    /* Need power-of-2 for efficient FFT; fft_n >= 2N to avoid circular aliasing */
+    size_t fft_n = 1;
+    while (fft_n < 2 * N) fft_n <<= 1;
+    s->fft_n = fft_n;
 
-    s->fft_aux = notorious_fft_mkaux_t2t3_1d((int)dct_n);
-    if (!s->fft_aux) { s->dct_evals = NULL; return; }
+    s->fft_aux = notorious_fft_mkaux_dft_1d((int)fft_n);
+    if (!s->fft_aux) { s->fft_kernel = NULL; return; }
 
-    s->dct_evals = charlton_alloc_doubles(dct_n);
-    s->dct_aux_buf = charlton_alloc_doubles(dct_n);
-    if (!s->dct_evals || !s->dct_aux_buf) {
-        charlton_aligned_free(s->dct_evals);
-        charlton_aligned_free(s->dct_aux_buf);
-        s->dct_evals = NULL;
-        s->dct_aux_buf = NULL;
+    s->fft_kernel = (notorious_fft_cmpl*)charlton_alloc_doubles(2 * fft_n);
+    s->fft_F_buf  = (notorious_fft_cmpl*)charlton_alloc_doubles(2 * fft_n);
+    s->fft_g_buf  = (notorious_fft_cmpl*)charlton_alloc_doubles(2 * fft_n);
+    s->boundary_weights = charlton_alloc_doubles(N);
+    if (!s->fft_kernel || !s->fft_F_buf || !s->fft_g_buf || !s->boundary_weights) {
+        charlton_aligned_free(s->fft_kernel);
+        charlton_aligned_free(s->fft_F_buf);
+        charlton_aligned_free(s->fft_g_buf);
+        charlton_aligned_free(s->boundary_weights);
+        s->fft_kernel = NULL;
+        s->fft_F_buf = NULL;
+        s->fft_g_buf = NULL;
+        s->boundary_weights = NULL;
         notorious_fft_free_aux(s->fft_aux);
         s->fft_aux = NULL;
         return;
     }
 
-    /* Form kernel: k[j] = j-th weight from first column of Toeplitz matrix */
+    /* Form kernel: c[j] = interior Toeplitz weight for distance j */
     double h_alpha = pow(s->h, s->alpha);
-    double *kernel = s->dct_aux_buf;
-    memset(kernel, 0, dct_n * sizeof(double));
-    for (size_t j = 0; j < N && j < dct_n; ++j) {
-        kernel[j] = h_alpha * s->gamma_alpha2 *
-            (s->k_alpha1_cache[j + 2] +
-             s->k_alpha1_cache[j] -
-             2.0 * s->k_alpha1_cache[j + 1]);
+    notorious_fft_cmpl *c_pad = s->fft_F_buf; /* borrow scratch */
+    memset(c_pad, 0, fft_n * sizeof(notorious_fft_cmpl));
+    for (size_t j = 0; j < N; ++j) {
+        double w;
+        if (j == 0) {
+            w = h_alpha * s->gamma_alpha2 * (pow(2.0, s->alpha + 1.0) - 2.0);
+        } else {
+            w = h_alpha * s->gamma_alpha2 *
+                (s->k_alpha1_cache[j + 2] + s->k_alpha1_cache[j]
+                 - 2.0 * s->k_alpha1_cache[j + 1]);
+        }
+        CHARLTON_FFT_RE(c_pad, j) = w;
+        CHARLTON_FFT_IM(c_pad, j) = 0.0;
     }
-    kernel[0] = h_alpha * s->gamma_alpha2;
 
-    /* DCT-II of kernel → eigenvalues */
-    notorious_fft_dct2(kernel, s->dct_evals, s->fft_aux);
+    /* FFT of padded kernel → fft_kernel */
+    notorious_fft_dft(c_pad, s->fft_kernel, s->fft_aux);
+
+    /* Populate boundary_weights: a_weights[n*(n+1)/2] for n=0..N-1 */
+    for (size_t n = 0; n < N; ++n) {
+        s->boundary_weights[n] = s->a_weights[n * (n + 1) / 2];
+    }
 }
 
 static inline int charlton_abm_init(charlton_abm_solver *s, double H, double T,
@@ -478,7 +512,7 @@ static inline int charlton_abm_init(charlton_abm_solver *s, double H, double T,
     if (!s->a_weights) return CHARLTON_ERR_ALLOC;
 
     charlton__compute_adams_weights(s);
-    charlton__compute_dct_eigenvalues(s);  /* May set dct_evals=NULL on failure, that's OK */
+    charlton__compute_fft_kernel(s);  /* May set fft_kernel=NULL on failure, that's OK */
 
     return CHARLTON_OK;
 }
@@ -487,8 +521,10 @@ static inline void charlton_abm_free(charlton_abm_solver *s) {
     charlton_aligned_free(s->a_weights);
     charlton_aligned_free(s->t_alpha_cache);
     charlton_aligned_free(s->k_alpha1_cache);
-    charlton_aligned_free(s->dct_evals);
-    charlton_aligned_free(s->dct_aux_buf);
+    charlton_aligned_free(s->boundary_weights);
+    charlton_aligned_free(s->fft_kernel);
+    charlton_aligned_free(s->fft_F_buf);
+    charlton_aligned_free(s->fft_g_buf);
     if (s->fft_aux) notorious_fft_free_aux(s->fft_aux);
     memset(s, 0, sizeof(*s));
 }
@@ -540,6 +576,72 @@ static inline charlton_cmplx charlton__char_exponent(const charlton_abm_solver *
     return integral * s->h;
 }
 
+/* FFT-accelerated causal convolution for lower-triangular Toeplitz matrix.
+ * Computes h0_all[n] = sum_{j=0}^{n} a_weights[n,j] * F[j]  for n=0..N-1.
+ * Uses FFT for the interior Toeplitz part and boundary corrections for j=0 and j=n. */
+static inline void charlton__fft_causal_convolve(const charlton_abm_solver *s,
+                                                 const charlton_cmplx *F_history,
+                                                 charlton_cmplx *h0_all) {
+    size_t N = s->N;
+    size_t fft_n = s->fft_n;
+    notorious_fft_cmpl *F_pad = s->fft_F_buf;
+    notorious_fft_cmpl *G_fft = s->fft_g_buf;
+
+    /* Pack F_history into interleaved complex, zero-pad to fft_n */
+    memset(F_pad, 0, fft_n * sizeof(notorious_fft_cmpl));
+    for (size_t j = 0; j < N; ++j) {
+        CHARLTON_FFT_RE(F_pad, j) = charlton_creal(F_history[j]);
+        CHARLTON_FFT_IM(F_pad, j) = charlton_cimag(F_history[j]);
+    }
+
+    /* Forward FFT of F_pad */
+    notorious_fft_dft(F_pad, G_fft, s->fft_aux);
+
+    /* Pointwise multiply by precomputed kernel FFT */
+    for (size_t k = 0; k < fft_n; ++k) {
+        double a = CHARLTON_FFT_RE(s->fft_kernel, k);
+        double b = CHARLTON_FFT_IM(s->fft_kernel, k);
+        double c = CHARLTON_FFT_RE(G_fft, k);
+        double d = CHARLTON_FFT_IM(G_fft, k);
+        CHARLTON_FFT_RE(G_fft, k) = a * c - b * d;
+        CHARLTON_FFT_IM(G_fft, k) = a * d + b * c;
+    }
+
+    /* Inverse FFT → circular convolution */
+    notorious_fft_invdft(G_fft, F_pad, s->fft_aux);
+
+    double scale = 1.0 / (double)fft_n;
+    double h_alpha = pow(s->h, s->alpha);
+    double diag_weight = h_alpha * s->gamma_alpha2;
+    double c0 = diag_weight * (pow(2.0, s->alpha + 1.0) - 2.0);
+
+    for (size_t n = 0; n < N; ++n) {
+        double conv_re = CHARLTON_FFT_RE(F_pad, n) * scale;
+        double conv_im = CHARLTON_FFT_IM(F_pad, n) * scale;
+
+        /* Boundary corrections:
+         * FFT computes sum c[n-j]*F[j] where c[] is the interior Toeplitz kernel.
+         * Actual ABM weight for j=0 is boundary_weights[n] (not c[n]).
+         * Actual ABM weight for j=n is diag_weight (not c[0]).
+         */
+        double corr_re, corr_im;
+        if (n == 0) {
+            /* Only one term; correction accounts for both boundary deviations */
+            corr_re = (s->boundary_weights[0] - c0) * charlton_creal(F_history[0]);
+            corr_im = (s->boundary_weights[0] - c0) * charlton_cimag(F_history[0]);
+        } else {
+            double cn = h_alpha * s->gamma_alpha2 *
+                (s->k_alpha1_cache[n + 2] + s->k_alpha1_cache[n]
+                 - 2.0 * s->k_alpha1_cache[n + 1]);
+            corr_re = (s->boundary_weights[n] - cn) * charlton_creal(F_history[0])
+                    + (diag_weight - c0) * charlton_creal(F_history[n]);
+            corr_im = (s->boundary_weights[n] - cn) * charlton_cimag(F_history[0])
+                    + (diag_weight - c0) * charlton_cimag(F_history[n]);
+        }
+        h0_all[n] = CHARLTON_CMPLX(conv_re + corr_re, conv_im + corr_im);
+    }
+}
+
 static inline charlton_cmplx charlton_abm_solve_single(const charlton_abm_solver *s,
                                                         charlton_cmplx u,
                                                         int n_picard) {
@@ -570,27 +672,68 @@ static inline charlton_cmplx charlton_abm_solve_single(const charlton_abm_solver
 
     h1_tilde[0] = 0.0;
 
-    for (size_t n = 0; n < N; ++n) {
-        charlton_cmplx h_as_tilde = charlton__asymptotic_term(s, u, n + 1, scale);
-
-        /* Convolution sum (O(N) per step, O(N^2) total — DCT path not yet wired for Picard) */
-        charlton_cmplx h0_tilde = 0.0;
-        for (size_t j = 0; j <= n; ++j) {
-            h0_tilde += s->a_weights[j + (n - j) * (n - j + 1) / 2] * F_history[j];
-        }
-
-        /* Picard iterations with early convergence check */
-        charlton_cmplx h1_new = h0_tilde;
-        for (int p = 0; p < n_picard; ++p) {
-            charlton_cmplx h1_old = h1_new;
+    if (s->fft_kernel != NULL && s->boundary_weights != NULL && !s->force_on2) {
+        /* ================================================================
+         * FFT Fast Path: Gauss-Seidel two-sweep
+         * Sweep 1: predictor with 1 Picard iteration per step (cheap)
+         * Sweep 2: FFT convolution + full corrector
+         * ================================================================ */
+        /* Sweep 1: predictor, 1 Picard iteration */
+        for (size_t n = 0; n < N; ++n) {
+            charlton_cmplx h_as_tilde = charlton__asymptotic_term(s, u, n + 1, scale);
+            charlton_cmplx h0_tilde = 0.0;
+            for (size_t j = 0; j <= n; ++j) {
+                h0_tilde += s->a_weights[j + (n - j) * (n - j + 1) / 2] * F_history[j];
+            }
+            charlton_cmplx h1_new = h0_tilde;
             charlton_cmplx F_pred = charlton__F_as1(s, u, h_as_tilde, h1_new, scale);
             h1_new = h0_tilde + s->a_weights[(n + 1) * (n + 2) / 2 - 1] * F_pred;
-            if (charlton_cabs(h1_new - h1_old) < 1e-14 * (1.0 + charlton_cabs(h1_new)))
-                break;
+            h1_tilde[n + 1] = h1_new;
+            F_history[n] = charlton__F_as1(s, u, h_as_tilde, h1_new, scale);
         }
 
-        h1_tilde[n + 1] = h1_new;
-        F_history[n] = charlton__F_as1(s, u, h_as_tilde, h1_new, scale);
+        /* Sweep 2: FFT convolution + full Picard */
+        charlton_cmplx *h0_all = charlton_alloc_cmplx(N);
+        if (h0_all) {
+            charlton__fft_causal_convolve(s, F_history, h0_all);
+            for (size_t n = 0; n < N; ++n) {
+                charlton_cmplx h_as_tilde = charlton__asymptotic_term(s, u, n + 1, scale);
+                charlton_cmplx h1_new = h0_all[n];
+                for (int p = 0; p < n_picard; ++p) {
+                    charlton_cmplx h1_old = h1_new;
+                    charlton_cmplx F_pred = charlton__F_as1(s, u, h_as_tilde, h1_new, scale);
+                    h1_new = h0_all[n] + s->a_weights[(n + 1) * (n + 2) / 2 - 1] * F_pred;
+                    if (charlton_cabs(h1_new - h1_old) < 1e-14 * (1.0 + charlton_cabs(h1_new)))
+                        break;
+                }
+                h1_tilde[n + 1] = h1_new;
+                F_history[n] = charlton__F_as1(s, u, h_as_tilde, h1_new, scale);
+            }
+            charlton_aligned_free(h0_all);
+        }
+    } else {
+        /* O(N^2) fallback */
+        for (size_t n = 0; n < N; ++n) {
+            charlton_cmplx h_as_tilde = charlton__asymptotic_term(s, u, n + 1, scale);
+
+            charlton_cmplx h0_tilde = 0.0;
+            for (size_t j = 0; j <= n; ++j) {
+                h0_tilde += s->a_weights[j + (n - j) * (n - j + 1) / 2] * F_history[j];
+            }
+
+            /* Picard iterations with early convergence check */
+            charlton_cmplx h1_new = h0_tilde;
+            for (int p = 0; p < n_picard; ++p) {
+                charlton_cmplx h1_old = h1_new;
+                charlton_cmplx F_pred = charlton__F_as1(s, u, h_as_tilde, h1_new, scale);
+                h1_new = h0_tilde + s->a_weights[(n + 1) * (n + 2) / 2 - 1] * F_pred;
+                if (charlton_cabs(h1_new - h1_old) < 1e-14 * (1.0 + charlton_cabs(h1_new)))
+                    break;
+            }
+
+            h1_tilde[n + 1] = h1_new;
+            F_history[n] = charlton__F_as1(s, u, h_as_tilde, h1_new, scale);
+        }
     }
 
     charlton_cmplx result = charlton__char_exponent(s, u, h1_tilde, scale);
@@ -1098,6 +1241,10 @@ static inline double charlton__sinh_sum_scalar(const charlton_cached_cf *cf,
     size_t N = cf->n_quad;
     double s_full = 0.0, s_half = 0.0;
     for (size_t j = 0; j < N; ++j) {
+        /* Skip NaN values from ABM solver (can occur for large |u|) */
+        if (!isfinite(cf->phi_re[j]) || !isfinite(cf->phi_im[j])) {
+            continue;
+        }
         charlton_cmplx xi = cf->u_re[j] + CHARLTON_I * cf->u_im[j];
         charlton_cmplx exp_arg = (cf->phi_re[j] + CHARLTON_I * cf->phi_im[j]) * V0 +
                                  CHARLTON_I * xi * (x_re + CHARLTON_I * x_im);
@@ -1153,6 +1300,15 @@ static inline double charlton__price_put_from_cache(const charlton_cached_cf *ca
     /* Numerical noise floor */
     double intrinsic = K * exp(-p->r * p->T) - p->S0 * exp(-p->q * p->T);
     if (intrinsic < 0.0) intrinsic = 0.0;
+
+    /* For deep ITM/OTM with certain contour parameters, the SINH quadrature
+     * can produce unreasonable results. Apply sanity bounds. */
+    double max_reasonable = K * 10.0;  /* Put price should never exceed ~K */
+    if (raw > max_reasonable) {
+        /* Numerical explosion - fall back to intrinsic for ITM, 0 for OTM */
+        raw = intrinsic > 0.0 ? intrinsic : 1e-12;
+    }
+
     if (raw < 0.0 && raw > -1e-8) raw = 1e-12;
     else if (raw < -1e-8) raw = intrinsic > 0.0 ? intrinsic : 0.0;
 
@@ -1287,33 +1443,33 @@ static inline int charlton_greeks(const charlton_model_params *params, double K,
     double bump;
     charlton_model_params p_up, p_dn;
 
-    /* Delta: dP/dS0 */
-    bump = 1e-4;
-    p_up = *params; p_up.S0 = params->S0 * (1.0 + bump);
-    p_dn = *params; p_dn.S0 = params->S0 * (1.0 - bump);
+    /* Delta: central finite differences */
     {
+        bump = 1e-4;
+        p_up = *params; p_up.S0 = params->S0 * (1.0 + bump);
+        p_dn = *params; p_dn.S0 = params->S0 * (1.0 - bump);
         double pu = charlton_price_put(&p_up, K, CHARLTON_DEFAULT_TOLERANCE);
         double pd = charlton_price_put(&p_dn, K, CHARLTON_DEFAULT_TOLERANCE);
         if (isfinite(pu) && isfinite(pd))
             result->delta = (pu - pd) / (2.0 * params->S0 * bump);
+        /* Enforce theoretical bounds [-1, 0] for put delta */
+        if (result->delta > 0.0) result->delta = 0.0;
+        if (result->delta < -1.0) result->delta = -1.0;
     }
-    /* Clamp put delta to [-1, 0] */
-    if (result->delta > 0.0) result->delta = 0.0;
-    if (result->delta < -1.0) result->delta = -1.0;
-    if (result->delta > -1e-6) result->delta = 0.0;
-    if (result->delta < -1.0 + 1e-6) result->delta = -1.0;
 
-    /* Gamma: d²P/dS0² */
+    /* Gamma: central finite differences */
     {
-        double pm = charlton_price_put(params, K, CHARLTON_DEFAULT_TOLERANCE);
+        bump = 1e-4;
+        p_up = *params; p_up.S0 = params->S0 * (1.0 + bump);
+        p_dn = *params; p_dn.S0 = params->S0 * (1.0 - bump);
+        double pm = result->price;
         double pu = charlton_price_put(&p_up, K, CHARLTON_DEFAULT_TOLERANCE);
         double pd = charlton_price_put(&p_dn, K, CHARLTON_DEFAULT_TOLERANCE);
         double h = params->S0 * bump;
         if (isfinite(pu) && isfinite(pm) && isfinite(pd))
             result->gamma = (pu - 2.0 * pm + pd) / (h * h);
+        if (result->gamma < 0.0) result->gamma = 0.0;
     }
-    if (result->gamma < 0.0) result->gamma = 0.0;
-    if (result->gamma < 1e-10) result->gamma = 1e-10;
 
     /* Theta: -dP/dT */
     {
@@ -2025,6 +2181,37 @@ static inline int charlton_cos_init(charlton_cos_workspace *ws, int n_ts, int n_
         memset(ws, 0, sizeof(*ws));
         return CHARLTON_ERR_ALLOC;
     }
+
+    /* Allocate DCT-accelerated grid-space buffers */
+    ws->grid_x = charlton_alloc_doubles((size_t)n_cos);
+    ws->grid_C = charlton_alloc_doubles((size_t)n_cos);
+    if (ws->grid_x && ws->grid_C) {
+        double ba = b - a;
+        for (int m = 0; m < n_cos; ++m) {
+            ws->grid_x[m] = a + ((double)m + 0.5) * ba / (double)n_cos;
+        }
+
+        /* Create Notorious-FFT plans */
+        ws->dct2_aux = notorious_fft_mkaux_t2t3_1d(n_cos);
+        ws->dct3_aux = notorious_fft_mkaux_t2t3_1d(n_cos);
+        ws->idft_aux = notorious_fft_mkaux_dft_1d(2 * n_cos);
+        ws->fft_buf = (notorious_fft_cmpl *)charlton_aligned_alloc(64,
+            (size_t)(2 * n_cos) * sizeof(notorious_fft_cmpl));
+
+        if (ws->dct2_aux && ws->dct3_aux && ws->idft_aux && ws->fft_buf) {
+            ws->use_dct = 1;
+        } else {
+            if (ws->dct2_aux) notorious_fft_free_aux(ws->dct2_aux);
+            if (ws->dct3_aux) notorious_fft_free_aux(ws->dct3_aux);
+            if (ws->idft_aux) notorious_fft_free_aux(ws->idft_aux);
+            charlton_aligned_free(ws->fft_buf);
+            ws->dct2_aux = NULL;
+            ws->dct3_aux = NULL;
+            ws->idft_aux = NULL;
+            ws->fft_buf = NULL;
+            ws->use_dct = 0;
+        }
+    }
     return CHARLTON_OK;
 }
 
@@ -2034,6 +2221,12 @@ static inline void charlton_cos_free(charlton_cos_workspace *ws) {
     charlton_aligned_free(ws->V_coeffs);
     charlton_aligned_free(ws->payoff_coeffs);
     charlton_aligned_free(ws->grid_vals);
+    charlton_aligned_free(ws->grid_x);
+    charlton_aligned_free(ws->grid_C);
+    if (ws->dct2_aux) notorious_fft_free_aux(ws->dct2_aux);
+    if (ws->dct3_aux) notorious_fft_free_aux(ws->dct3_aux);
+    if (ws->idft_aux) notorious_fft_free_aux(ws->idft_aux);
+    charlton_aligned_free(ws->fft_buf);
     memset(ws, 0, sizeof(*ws));
 }
 
@@ -2299,9 +2492,85 @@ static inline double charlton__cos_cont_coeff(const charlton_cos_workspace *ws,
     return (2.0 / ba) * H_k;
 }
 
+/* DCT-accelerated backward step: grid-space round-trip via DCT-II/III.
+ * Evaluates continuation on half-integer grid, applies early exercise,
+ * then forward DCT-II to get new coefficients. O(N log N) per step. */
+static inline double charlton__cos_backward_step_dct(charlton_cos_workspace *ws, double K,
+                                                      int is_call, double r_dt) {
+    int N = ws->n_cos_terms;
+    double discount = exp(-r_dt);
+
+    /* Reuse scratch buffers */
+    double *X = ws->grid_vals;      /* DCT-III input (cosine weights) */
+    double *Y = ws->payoff_coeffs;  /* DST-III input (sine weights) */
+    double *C_grid = ws->grid_C;    /* continuation on grid */
+    double *S_grid = ws->grid_vals; /* DST-III output (reuses X buffer) */
+
+    /* Form DCT-III input: X_0 = c_0/2, X_k = c_k/2 for k>0 */
+    X[0] = discount * 0.25 * ws->V_coeffs[0] * ws->cf_re[0];
+    for (int k = 1; k < N; ++k) {
+        X[k] = discount * 0.5 * ws->V_coeffs[k] * ws->cf_re[k];
+        Y[k-1] = -discount * 0.5 * ws->V_coeffs[k] * ws->cf_im[k];
+    }
+    Y[N-1] = 0.0;
+    double X0 = X[0]; /* save before X is overwritten */
+
+    /* DCT-III(X) → A_m - X_0  (cosine part of continuation) */
+    notorious_fft_dct3(X, C_grid, ws->dct3_aux);
+
+    /* DST-III(Y) → B_m  (sine part of continuation) */
+    notorious_fft_dst3(Y, S_grid, ws->dct3_aux);
+
+    /* Assemble continuation and apply early exercise */
+    double x_star = is_call ? ws->b : ws->a;
+    int exercise_optimal = 0;
+
+    if (!is_call) {
+        for (int m = 0; m < N; ++m) {
+            double cont = C_grid[m] + X0 + S_grid[m];
+            double x = ws->grid_x[m];
+            double payoff = (x <= 0.0) ? K * (1.0 - exp(x)) : 0.0;
+            if (payoff > cont) {
+                C_grid[m] = payoff;
+                if (!exercise_optimal) {
+                    exercise_optimal = 1;
+                    x_star = x;
+                }
+            } else {
+                C_grid[m] = cont;
+            }
+        }
+    } else {
+        for (int m = N - 1; m >= 0; --m) {
+            double cont = C_grid[m] + X0 + S_grid[m];
+            double x = ws->grid_x[m];
+            double payoff = (x >= 0.0) ? K * (exp(x) - 1.0) : 0.0;
+            if (payoff > cont) {
+                C_grid[m] = payoff;
+                if (!exercise_optimal) {
+                    exercise_optimal = 1;
+                    x_star = x;
+                }
+            } else {
+                C_grid[m] = cont;
+            }
+        }
+    }
+
+    /* Forward DCT-II → new coefficients V_k = DCT-II(C_grid)_k / N */
+    double *V_new = ws->grid_vals;
+    notorious_fft_dct2(C_grid, V_new, ws->dct2_aux);
+    double invN = 1.0 / (double)N;
+    for (int k = 0; k < N; ++k) {
+        ws->V_coeffs[k] = V_new[k] * invN;
+    }
+
+    return exercise_optimal ? x_star : (is_call ? ws->b : ws->a);
+}
+
 /* One backward induction step using Fang-Oosterlee analytic coefficient update.
- * No grid-space round-trip — works entirely in COS coefficient space.
- * Returns exercise boundary x* (in log-moneyness). */
+ * Returns exercise boundary x* (in log-moneyness).
+ * When DCT is available, delegates to grid-space round-trip. */
 static inline double charlton__cos_backward_step(charlton_cos_workspace *ws, double K,
                                                    int is_call, double r_dt) {
     int N = ws->n_cos_terms;
@@ -2310,17 +2579,20 @@ static inline double charlton__cos_backward_step(charlton_cos_workspace *ws, dou
     double b = ws->b;
     double discount = exp(-r_dt);
 
+    /* Fast path: DCT-accelerated grid-space round-trip */
+    if (ws->use_dct) {
+        return charlton__cos_backward_step_dct(ws, K, is_call, r_dt);
+    }
+
     /* Step 1: Find exercise boundary x* via bisection.
-     * For put: find rightmost x where payoff(x) >= continuation(x).
-     * payoff(x) = K*(1 - e^x) for x <= 0, 0 for x > 0. */
+     * For put: find rightmost x where payoff(x) >= continuation(x). */
     double x_lo = a, x_hi = 0.0; /* for puts, boundary is in [a, 0] */
     if (is_call) { x_lo = 0.0; x_hi = b; }
 
-    /* Check if early exercise is ever optimal */
     double pay_lo, pay_hi, cont_lo, cont_hi;
     if (!is_call) {
         pay_lo = K * (1.0 - exp(x_lo));
-        pay_hi = 0.0; /* payoff at x=0 */
+        pay_hi = 0.0;
         cont_lo = charlton__cos_continuation(ws, x_lo, discount);
         cont_hi = charlton__cos_continuation(ws, x_hi, discount);
     } else {
@@ -2334,10 +2606,8 @@ static inline double charlton__cos_backward_step(charlton_cos_workspace *ws, dou
     int exercise_optimal = 0;
 
     if (!is_call) {
-        /* For put: if payoff(a) > continuation(a), there's early exercise */
         if (pay_lo > cont_lo) {
             exercise_optimal = 1;
-            /* Bisect to find x* where payoff = continuation */
             for (int iter = 0; iter < 50; ++iter) {
                 double x_mid = 0.5 * (x_lo + x_hi);
                 double pay_mid = K * (1.0 - exp(x_mid));
@@ -2349,11 +2619,9 @@ static inline double charlton__cos_backward_step(charlton_cos_workspace *ws, dou
             }
             x_star = 0.5 * (x_lo + x_hi);
         } else {
-            /* No early exercise — continuation dominates everywhere */
             x_star = a;
         }
     } else {
-        /* For call: if payoff(b) > continuation(b), there's early exercise */
         if (pay_hi > cont_hi) {
             exercise_optimal = 1;
             for (int iter = 0; iter < 50; ++iter) {
@@ -2372,50 +2640,30 @@ static inline double charlton__cos_backward_step(charlton_cos_workspace *ws, dou
     }
 
     /* Step 2: Update V_coeffs analytically.
-     * For put: V(x) = payoff on [a, x*], continuation on [x*, b].
-     * V_k = (2/(b-a)) * [integral_a^{x*} K(1-e^x)cos(w_k(x-a)) dx
-     *                    + integral_{x*}^b C(x) cos(w_k(x-a)) dx] */
-
-    if (!exercise_optimal && !is_call) {
-        /* No early exercise: V_k = continuation coefficient on full [a, b] */
+     * OPTIMIZATION: full-interval [a,b] uses orthogonality → O(N) */
+    if (!exercise_optimal) {
         for (int k = 0; k < N; ++k) {
-            ws->grid_vals[k] = charlton__cos_cont_coeff(ws, k, a, b, discount);
-        }
-    } else if (!exercise_optimal && is_call) {
-        for (int k = 0; k < N; ++k) {
-            ws->grid_vals[k] = charlton__cos_cont_coeff(ws, k, a, b, discount);
+            ws->grid_vals[k] = discount * ws->cf_re[k] * ws->V_coeffs[k];
         }
     } else if (!is_call) {
-        /* Put with early exercise at x* */
         for (int k = 0; k < N; ++k) {
-            /* Payoff part on [a, x*] */
             double chi_k, psi_k;
             charlton__cos_chi_psi(a, b, a, x_star, k, &chi_k, &psi_k);
             double payoff_k = (2.0 / ba) * K * (psi_k - chi_k);
-
-            /* Continuation part on [x*, b] */
             double cont_k = charlton__cos_cont_coeff(ws, k, x_star, b, discount);
-
             ws->grid_vals[k] = payoff_k + cont_k;
         }
     } else {
-        /* Call with early exercise at x* */
         for (int k = 0; k < N; ++k) {
-            /* Continuation on [a, x*] */
             double cont_k = charlton__cos_cont_coeff(ws, k, a, x_star, discount);
-
-            /* Payoff on [x*, b] */
             double chi_k, psi_k;
             charlton__cos_chi_psi(a, b, x_star, b, k, &chi_k, &psi_k);
             double payoff_k = (2.0 / ba) * K * (chi_k - psi_k);
-
             ws->grid_vals[k] = cont_k + payoff_k;
         }
     }
 
-    /* Copy new coefficients */
     memcpy(ws->V_coeffs, ws->grid_vals, (size_t)N * sizeof(double));
-
     return exercise_optimal ? x_star : (is_call ? b : a);
 }
 
